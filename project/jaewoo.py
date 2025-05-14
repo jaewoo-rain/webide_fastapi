@@ -18,7 +18,7 @@ docker_client = docker.from_env()
 DEFAULT_VNC_START = 10007
 DEFAULT_NOVNC_START = 6080
 MAX_TRIES = 10
-DOCKER_NAME = "docker-file"
+global DOCKER_NAME
 DOCKER_DISPLAY = ":1"
 
 # 기본 이미지 설정 파일, 다른 이미지 받으면 대체 됨
