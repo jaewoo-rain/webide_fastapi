@@ -53,7 +53,7 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
 
 @app.post("/create")
 def run_container(req: RunRequest):
-    global DOCKER_NAME    
+    # global DOCKER_NAME    
     # 사용 가능한 포트 쌍 탐색
     try:
         vnc_port, novnc_port = find_free_ports(
@@ -63,7 +63,7 @@ def run_container(req: RunRequest):
         raise HTTPException(status_code=409, detail=str(e))
 
     container_name = f"webide-vnc-{uuid.uuid4().hex[:8]}"
-    DOCKER_NAME = container_name
+    # DOCKER_NAME = container_name
     try:
         container = docker_client.containers.run(
             req.image,
@@ -109,6 +109,7 @@ async def get_index():
 @app.get("/main", response_class=HTMLResponse)
 def go_main():
     return "index.h"
+
 # 2. "/run"은 코드 실행 처리
 @app.post("/run")
 async def run_code(request: Request):
@@ -123,7 +124,7 @@ async def run_code(request: Request):
         f.write(code)
 
     remote_path = f"/tmp/{filename}"
-
+    print("저장하기 :",remote_path)
     # turtle 코드인지 확인
     is_turtle = "import turtle" in code
 
