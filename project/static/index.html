@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Python 코드 실행기</title>
+</head>
+<body>
+    <h1>Python 코드 실행</h1>
+
+    <textarea id="code" rows="20" cols="80" placeholder="여기에 코드를 작성하세요"></textarea>
+    <br><br>
+    <button onclick="runCode()">실행</button>
+
+    <h2>실행 결과</h2>
+    <pre id="output"></pre>
+
+    <h2>VNC 화면 (Turtle 코드일 때)</h2>
+    <!-- <iframe id="vnc" src="http://localhost:6080/vnc.html" width="1024" height="768" style="display:none;"></iframe> -->
+    <iframe id="vnc"   src="http://localhost:6080/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
+width="1024" height="768"  style="display:none;"></iframe>
+
+
+    <script>
+        async function runCode() {
+            const code = document.getElementById("code").value;
+            const output = document.getElementById("output");
+            const vnc = document.getElementById("vnc");
+
+            output.textContent = "실행 중...";
+
+            const response = await fetch("/run", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ code: code })
+            });
+
+            const result = await response.json();
+
+            console.log(result)
+
+            if (result.type === "turtle") {
+                vnc.style.display = "block";
+                output.textContent = "터틀 코드가 실행 중입니다. 위의 화면을 보세요.";
+            } else {
+                vnc.style.display = "none";
+                output.textContent = result.output;
+            }
+        }
+    </script>
+</body>
+</html>

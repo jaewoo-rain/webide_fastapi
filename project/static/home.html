@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Document</title>
+</head>
+<body>
+  <button id="createProject">프로젝트 만들기</button>
+  <a href="/index.html">일반 링크</a>
+
+  <script>
+    document.getElementById('createProject').addEventListener('click', async () => {
+      try {
+        const res = await fetch('/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            image: 'docker-file'
+          })
+        });
+
+        if (!res.ok) {
+          const error = await res.json();
+          throw new Error(error.detail || 'Unknown error');
+        }
+
+        const data = await res.json();
+        console.log('Container started:', data);
+
+        console.log('성공', data["novnc_port"])
+        // 성공하면 index.html로 이동
+        // window.location.href = 'static/index.html';
+
+      } catch (err) {
+        console.error('Error starting container:', err);
+        alert('컨테이너 실행에 실패했습니다:\n' + err.message);
+      }
+    });
+  </script>
+</body>
+</html>
