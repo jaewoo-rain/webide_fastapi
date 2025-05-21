@@ -12,6 +12,7 @@ app = FastAPI()
 # Static 폴더 등록
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 docker_client = docker.from_env()
 
 # 기본 포트 설정
@@ -51,9 +52,15 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
             return vport, nport
     raise RuntimeError(f"No free ports available after {max_tries} tries.")
 
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.ico")
+
+
 @app.post("/create")
 def run_container(req: RunRequest):
-    # global DOCKER_NAME    
+    # global DOCKER_NAME
     # 사용 가능한 포트 쌍 탐색
     try:
         vnc_port, novnc_port = find_free_ports(
@@ -106,9 +113,6 @@ async def get_index():
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-@app.get("/main", response_class=HTMLResponse)
-def go_main():
-    return "index.h"
 
 # 2. "/run"은 코드 실행 처리
 @app.post("/run")
@@ -120,7 +124,7 @@ async def run_code(request: Request):
 
     filename = "temp_turtle.py"
     local_path = os.path.join(os.getcwd(), filename)
-    with open(local_path, "w") as f:
+    with open(local_path, "w", encoding="utf-8") as f:
         f.write(code)
 
     remote_path = f"/tmp/{filename}"
