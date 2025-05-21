@@ -38,12 +38,27 @@ width="1024" height="768"  style="display:none;"></iframe>
 
             console.log(result)
 
-            if (result.type === "turtle") {
-                vnc.style.display = "block";
-                output.textContent = "터틀 코드가 실행 중입니다. 위의 화면을 보세요." + result.output;
-            } else {
+            if (result.status === "error") {
                 vnc.style.display = "none";
+                // output.textContent = "오류 발생:\n" + (res.error || JSON.stringify(res));
                 output.textContent = result.output;
+
+            } else if(result.status === "running"){
+                if(result.type === "gui"){
+                    vnc.style.display = "block";
+                    output.textContent = result.output;  
+                }else if(result.type === "cli"){
+                    print("clisss")
+                    console.log("cliiss")
+                    vnc.style.display = "none";
+                    output.textContent = result.output;
+                }else{
+                    vnc.style.display = "none";
+                    output.textContent = result.output;
+                }
+              
+            } else {
+
             }
         }
     </script>

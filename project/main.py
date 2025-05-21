@@ -123,7 +123,6 @@ async def get_index():
 
 
 
-
 import ast
 
 def is_turtle_code(source: str) -> bool:
@@ -141,7 +140,6 @@ def is_turtle_code(source: str) -> bool:
             if node.value.id in ("turtle",):
                 return True
     return False
-
 
 
 # 2. "/run"은 코드 실행 처리
@@ -173,7 +171,6 @@ async def run_code(request: Request):
         "docker", "cp", local_path, f"{DOCKER_NAME}:{remote_path}"
     ])
 
-
     # turtle 코드인지 확인
 
     try:
@@ -185,7 +182,7 @@ async def run_code(request: Request):
             ])
             return JSONResponse(
                 status_code=200,
-                content= {"status": "running", "type": "turtle"}
+                content= {"status": "running", "type": "gui"}
             )
         else:
             # CLI 실행하기

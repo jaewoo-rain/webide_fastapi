@@ -6,6 +6,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
+import traceback; 
+import ast
 
 app = FastAPI()
 
@@ -124,10 +126,6 @@ async def get_index():
 
 
 
-import ast
-
-import ast
-
 def is_turtle_code(source: str) -> bool:
     tree = ast.parse(source)
 
@@ -140,11 +138,11 @@ def is_turtle_code(source: str) -> bool:
             if any(alias.name == "turtle" for alias in node.names):
                 has_import = True
 
-        # 2) from turtle import forward, Screen 등
+        # 2) from turtle import forward 등
         if isinstance(node, ast.ImportFrom) and node.module == "turtle":
             has_import = True
 
-        # 3) turtle.xxx() 호출 (Attribute)
+        # 3) 실제 turtle.<something>() 호출
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id == "turtle":
                 has_usage = True
@@ -153,21 +151,36 @@ def is_turtle_code(source: str) -> bool:
     return has_import and has_usage
 
 
-# def is_turtle_code(source: str) -> bool:
-#     tree = ast.parse(source)
-#     for node in ast.walk(tree):
-#         # 1) import turtle 또는 import turtle as t
-#         if isinstance(node, ast.Import):
-#             if any(alias.name == "turtle" for alias in node.names):
-#                 return True
-#         # 2) from turtle import forward 등
-#         if isinstance(node, ast.ImportFrom) and node.module == "turtle":
-#             return True
-#         # 3) 실제 turtle.<something>() 호출
-#         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-#             if node.value.id in ("turtle",):
-#                 return True
-#     return False
+# GUI 라이브러리 패턴
+GUI_LIBS = [
+    {"name":"turtle", "import": ["import turtle", "from turtle import"], "usage": ["turtle."]},
+    {"name":"tkinter", "import": ["import tkinter", "from tkinter import"], "usage": ["Tk(", "Button(", "Canvas("]},
+    {"name":"PyQt5", "import": ["from PyQt5 import", "import PyQt5"], "usage": ["QApplication(", "QMainWindow("]},
+    {"name":"PySide2", "import": ["from PySide2 import", "import PySide2"], "usage": ["QApplication(", "QMainWindow("]},
+    {"name":"wx", "import": ["import wx"], "usage": ["wx.App(", "wx.Frame("]},
+    {"name":"kivy", "import": ["from kivy.app import App"], "usage": ["App("]},
+    {"name":"PySimpleGUI", "import": ["import PySimpleGUI"], "usage": ["Window(", "Button("]},
+    {"name":"pygame", "import": ["import pygame"], "usage": ["pygame.init(", "display.set_mode("]},
+]
+
+def detect_imports(source:str, patterns:list) -> bool:
+    return any(pat in source for pat in patterns)
+
+
+def detect_usage(source:str, patterns:list) -> bool:
+    return any(pat in source for pat in patterns)
+
+
+def is_gui_code(source: str) -> bool:
+    # AST 파싱 시 syntax 오류 체크
+    tree = ast.parse(source)
+    for lib in GUI_LIBS:
+        has_imp = detect_imports(source, lib["import"])
+        has_use = detect_usage(source, lib["usage"])
+        if has_imp and has_use:
+            return True
+    return False
+
 
 
 # 2. "/run"은 코드 실행 처리
@@ -194,24 +207,65 @@ async def run_code(request: Request):
         "pkill", "-f", f"python3 {remote_path}"
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 파일 복사
-    subprocess.run([
-        "docker", "cp", local_path, f"{DOCKER_NAME}:{remote_path}"
-    ])
+      # 컨테이너 복사/kill
+    subprocess.run(["docker","exec",DOCKER_NAME,"pkill","-f",f"python3 {remote_path}"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["docker","cp",local_path,f"{DOCKER_NAME}:{remote_path}"])
+
+    # # GUI 감지
+    # try:
+    #     gui_mode = is_gui_code(code)
+    # except SyntaxError as e:
+    #     return JSONResponse({"status":"error","type":"syntax","error":f"{e.msg} at line {e.lineno}"},status_code=400)
+
+    # # 실행 및 에러 캡처
+    # if gui_mode:
+    #     # 테스트 실행으로 오류 확인
+    #     try:
+    #         # 먼저 cli로 실행해봄
+    #         test = subprocess.run([
+    #             "docker","exec",DOCKER_NAME,"python3",remote_path
+    #         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    #     except subprocess.TimeoutExpired:
+    #         # 응답이 돌아오지 않아서 GUI가 실행되었다고 판단
+    #         subprocess.Popen([
+    #             "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #         ])
+    #         return JSONResponse({"status":"running","type":"gui"})
+
+    #     if test.returncode != 0: # 에러 발생(예: NameError)
+    #         return JSONResponse({"status":"error","type":"runtime","error":test.stderr.decode()},status_code=400)
+        
+    #     # 정상 test.returncode == 0 이면 → 에러 없이 종료(즉 GUI를 띄우지 않았거나, “종료 가능한” 스크립트)
+    #     subprocess.Popen([
+    #         "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #     ])
+    #     return JSONResponse({"status":"running","type":"gui"})
+    # else:
+    #     # CLI 모드
+    #     result = subprocess.run([
+    #         "docker","exec",DOCKER_NAME,"python3",remote_path
+    #     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #     output = result.stdout.decode() + result.stderr.decode()
+    #     return JSONResponse({"status":"done","type":"text","output":output})
+
+
 
 
     # turtle 코드인지 확인
 
     try:
         if is_turtle_code(code):
+            
             # GUI 실행하기
             subprocess.Popen([
                 "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
                 DOCKER_NAME, "python3", remote_path
             ])
+            print("gui")
             return JSONResponse(
-                status_code=200,
-                content= {"status": "running", "type": "turtle"}
+                status_code=201,
+                content= {"status": "running", "type": "gui"}
             )
         else:
             # CLI 실행하기
@@ -222,20 +276,32 @@ async def run_code(request: Request):
 
             output = result.stdout.decode() + result.stderr.decode()
             # return {"status": "done", "type": "text", "output": output}
+            print("cli")
+            if "Traceback" in output:
+                # 여기가 예외를 강제로 발생시키는 부분
+                raise Exception(output)
+        
             return JSONResponse(
-                status_code=200,
-                content= {"status": "done", "type": "text", "output": output}
+                status_code=202,
+                content= {"status": "running", "type": "cli", "output": output}
             )
+        
     except Exception as e:
         # 예외 메시지를 문자열로 변환
-        # return {"status": "done", "type": "text", "output": str(e)}
-
         err_msg = str(e)
-        # 필요시 traceback도 붙일 수 있습니다:
-        import traceback; 
         err_msg = traceback.format_exc()
+
+        if "No module named" in output:
+            import re
+            m = re.search(r"No module named ['\"]([^'\"]+)['\"]", err_msg)
+
+            print(m.group(1),"을 다운받아야함")
+            err_msg += f"{m.group(1)}을 다운받아야함"
+        
+        print("에러메시지: ", err_msg)
+
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "type": "text", "output": err_msg}
+            content={"status": "error", "type": "cli", "output": err_msg}
         )
 
