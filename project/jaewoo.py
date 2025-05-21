@@ -138,7 +138,7 @@ def is_turtle_code(source: str) -> bool:
             return True
         # 3) 실제 turtle.<something>() 호출
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in ("turtle",):  
+            if node.value.id in ("turtle",):
                 return True
     return False
 
