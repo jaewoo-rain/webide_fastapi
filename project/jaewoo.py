@@ -126,22 +126,48 @@ async def get_index():
 
 import ast
 
+import ast
+
 def is_turtle_code(source: str) -> bool:
     tree = ast.parse(source)
+
+    has_import = False
+    has_usage  = False
+
     for node in ast.walk(tree):
         # 1) import turtle 또는 import turtle as t
         if isinstance(node, ast.Import):
             if any(alias.name == "turtle" for alias in node.names):
-                return True
-        # 2) from turtle import forward 등
-        if isinstance(node, ast.ImportFrom) and node.module == "turtle":
-            return True
-        # 3) 실제 turtle.<something>() 호출
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in ("turtle",):
-                return True
-    return False
+                has_import = True
 
+        # 2) from turtle import forward, Screen 등
+        if isinstance(node, ast.ImportFrom) and node.module == "turtle":
+            has_import = True
+
+        # 3) turtle.xxx() 호출 (Attribute)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "turtle":
+                has_usage = True
+
+    # import와 usage가 모두 있어야 turtle 코드로 본다
+    return has_import and has_usage
+
+
+# def is_turtle_code(source: str) -> bool:
+#     tree = ast.parse(source)
+#     for node in ast.walk(tree):
+#         # 1) import turtle 또는 import turtle as t
+#         if isinstance(node, ast.Import):
+#             if any(alias.name == "turtle" for alias in node.names):
+#                 return True
+#         # 2) from turtle import forward 등
+#         if isinstance(node, ast.ImportFrom) and node.module == "turtle":
+#             return True
+#         # 3) 실제 turtle.<something>() 호출
+#         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+#             if node.value.id in ("turtle",):
+#                 return True
+#     return False
 
 
 # 2. "/run"은 코드 실행 처리
