@@ -54,11 +54,15 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
 @app.post("/create")
 def run_container(req: RunRequest):
     global DOCKER_NAME    
+    global DEFAULT_NOVNC_START
+    
     # 사용 가능한 포트 쌍 탐색
     try:
         vnc_port, novnc_port = find_free_ports(
             DEFAULT_VNC_START, DEFAULT_NOVNC_START, MAX_TRIES
         )
+        DEFAULT_NOVNC_START = novnc_port
+        print(vnc_port, novnc_port)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -106,9 +110,14 @@ async def get_index():
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-@app.get("/main", response_class=HTMLResponse)
-def go_main():
-    return "index.h"
+
+@app.get("/main/{novnc_port}", response_class=HTMLResponse)
+def main():
+    with open("static/index.html", "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
+
+
 # 2. "/run"은 코드 실행 처리
 @app.post("/run")
 async def run_code(request: Request):
@@ -123,7 +132,7 @@ async def run_code(request: Request):
         f.write(code)
 
     remote_path = f"/tmp/{filename}"
-
+    print("저장하기 :",remote_path)
     # turtle 코드인지 확인
     is_turtle = "import turtle" in code
 

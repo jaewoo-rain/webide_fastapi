@@ -51,7 +51,7 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
             return vport, nport
     raise RuntimeError(f"No free ports available after {max_tries} tries.")
 
-@app.post("/create")
+@app.post("/create")g
 def run_container(req: RunRequest):
     global DOCKER_NAME    
     # 사용 가능한 포트 쌍 탐색
