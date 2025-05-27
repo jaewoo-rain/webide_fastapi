@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+<<<<<<< HEAD
 import turtle
 
 screen = turtle.Screen()
@@ -20,3 +21,8 @@ for i in range(360):
 screen.exitonclick()
 
 print('hello')
+=======
+import jaewoo
+
+print("jaewoo")
+>>>>>>> e78b4b52879c010fb0ff2ccc05525f21cbf494aa

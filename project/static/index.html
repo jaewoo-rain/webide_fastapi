@@ -47,6 +47,7 @@
 
         console.log(result);
 
+<<<<<<< HEAD
         if (result.type === "turtle") {
           const vncIframe = document.getElementById("vnc");
 
@@ -70,6 +71,29 @@
         } else {
           vnc.style.display = "none";
           output.textContent = result.output;
+=======
+            if (result.status === "error") {
+                vnc.style.display = "none";
+                // output.textContent = "오류 발생:\n" + (res.error || JSON.stringify(res));
+                output.textContent = result.output;
+
+            } else if(result.status === "running"){
+                if(result.type === "gui"){
+                    vnc.style.display = "block";
+                    output.textContent = result.output;  
+                }else if(result.type === "cli"){
+                    console.log("cli출력모드")
+                    vnc.style.display = "none";
+                    output.textContent = result.output;
+                }else{
+                    vnc.style.display = "none";
+                    output.textContent = result.output;
+                }
+              
+            } else {
+
+            }
+>>>>>>> e78b4b52879c010fb0ff2ccc05525f21cbf494aa
         }
       }
     </script>

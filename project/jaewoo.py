@@ -6,6 +6,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
+import traceback; 
+import ast
 
 app = FastAPI()
 
@@ -121,28 +123,30 @@ async def get_index():
     return HTMLResponse(content=html_content)
 
 
-
-
-
-import ast
-
+# ast 이용하여 GUI 판단하기 위한 코드
 def is_turtle_code(source: str) -> bool:
     tree = ast.parse(source)
+
+    has_import = False
+    has_usage  = False
+
     for node in ast.walk(tree):
         # 1) import turtle 또는 import turtle as t
         if isinstance(node, ast.Import):
             if any(alias.name == "turtle" for alias in node.names):
-                return True
+                has_import = True
+
         # 2) from turtle import forward 등
         if isinstance(node, ast.ImportFrom) and node.module == "turtle":
-            return True
+            has_import = True
+
         # 3) 실제 turtle.<something>() 호출
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in ("turtle",):  
-                return True
-    return False
+            if node.value.id == "turtle":
+                has_usage = True
 
-
+    # import와 usage가 모두 있어야 turtle 코드로 본다
+    return has_import and has_usage
 
 # 2. "/run"은 코드 실행 처리
 @app.post("/run")
@@ -168,25 +172,45 @@ async def run_code(request: Request):
         "pkill", "-f", f"python3 {remote_path}"
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 파일 복사
-    subprocess.run([
-        "docker", "cp", local_path, f"{DOCKER_NAME}:{remote_path}"
-    ])
-
+    # .py 파일 넣기
+    subprocess.run(["docker","cp",local_path,f"{DOCKER_NAME}:{remote_path}"])
 
     # turtle 코드인지 확인
 
     try:
         if is_turtle_code(code):
+            
             # GUI 실행하기
-            subprocess.Popen([
+            proc = subprocess.Popen([
                 "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
                 DOCKER_NAME, "python3", remote_path
-            ])
-            return JSONResponse(
-                status_code=200,
-                content= {"status": "running", "type": "turtle"}
-            )
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            try:
+                # proc.returncode 는 프로세스가 종료된 뒤에만 None → 정수(종료코드) 로 바뀜, 
+                # 실행직후는 모두 None
+                out, err = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                print('gui정상 실행')
+                # 2초동안 종료되지 않음 -> 정상적으로 동작함
+                return JSONResponse(
+                    status_code=201,
+                    content= {"status": "running", "type": "gui"}
+                )
+            else: # 아무런 예외도 발생하지 않았을 때
+                # 프로세스가 끝나 버렸으므로, 에러 혹은 빠른 정상 종료
+                if proc.returncode != 0:
+                    # 에러가 났다
+                    msg = err.decode()
+                    print('gui실패')
+
+                    raise Exception(f"GUI 실행 실패:\n{msg}")
+                else: 
+                    print('정상 작동 하였지만 금방 끝남')
+                    return JSONResponse(
+                    status_code=201,
+                    content= {"status": "running", "type": "gui"}
+                    )
         else:
             # CLI 실행하기
             result = subprocess.run([
@@ -194,22 +218,79 @@ async def run_code(request: Request):
                 DOCKER_NAME, "python3", remote_path
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+            if result.stdout:
+                print('성공')
+            elif result.stderr:
+                print('실패')
+                raise Exception(result.stderr.decode())
+
             output = result.stdout.decode() + result.stderr.decode()
             # return {"status": "done", "type": "text", "output": output}
+            print("cli")
+            # if "Traceback" in output:
+            #     # 여기가 예외를 강제로 발생시키는 부분
+            #     raise Exception(output)
+        
             return JSONResponse(
                 status_code=200,
-                content= {"status": "done", "type": "text", "output": output}
+                content= {"status": "running", "type": "cli", "output": output}
             )
+
+   
+    # # GUI 감지
+    # try:
+    #     gui_mode = is_gui_code(code)
+    # except SyntaxError as e:
+    #     return JSONResponse({"status":"error","type":"syntax","error":f"{e.msg} at line {e.lineno}"},status_code=400)
+
+    # # 실행 및 에러 캡처
+    # if gui_mode:
+    #     # 테스트 실행으로 오류 확인
+    #     try:
+    #         # 먼저 cli로 실행해봄
+    #         test = subprocess.run([
+    #             "docker","exec",DOCKER_NAME,"python3",remote_path
+    #         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    #     except subprocess.TimeoutExpired:
+    #         # 응답이 돌아오지 않아서 GUI가 실행되었다고 판단
+    #         subprocess.Popen([
+    #             "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #         ])
+    #         return JSONResponse({"status":"running","type":"gui"})
+
+    #     if test.returncode != 0: # 에러 발생(예: NameError)
+    #         return JSONResponse({"status":"error","type":"runtime","error":test.stderr.decode()},status_code=400)
+        
+    #     # 정상 test.returncode == 0 이면 → 에러 없이 종료(즉 GUI를 띄우지 않았거나, “종료 가능한” 스크립트)
+    #     subprocess.Popen([
+    #         "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #     ])
+    #     return JSONResponse({"status":"running","type":"gui"})
+    # else:
+    #     # CLI 모드
+    #     result = subprocess.run([
+    #         "docker","exec",DOCKER_NAME,"python3",remote_path
+    #     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #     output = result.stdout.decode() + result.stderr.decode()
+    #     return JSONResponse({"status":"done","type":"text","output":output})
+
+
     except Exception as e:
         # 예외 메시지를 문자열로 변환
-        # return {"status": "done", "type": "text", "output": str(e)}
-
         err_msg = str(e)
-        # 필요시 traceback도 붙일 수 있습니다:
-        import traceback; 
-        err_msg = traceback.format_exc()
+        # err_msg = traceback.format_exc()
+
+        # if "No module named" in output:
+        #     import re
+        #     m = re.search(r"No module named ['\"]([^'\"]+)['\"]", err_msg)
+
+        #     print(m.group(1),"을 다운받아야함")
+        #     err_msg += f"{m.group(1)}을 다운받아야함"
+        
+        # print("에러메시지: ", err_msg)
+
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "type": "text", "output": err_msg}
+            content={"status": "error", "type": "cli", "output": err_msg}
         )
 

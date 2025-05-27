@@ -1,0 +1,42 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VNC_PASSWORD=jaewoo \
+    VNC_GEOMETRY=1024x768 \
+    VNC_DEPTH=24 \
+    VNC_PORT=5901 \
+    NOVNC_PORT=6080
+
+# 필수 패키지 설치
+RUN apt-get update && apt-get install -y \
+    tigervnc-standalone-server \
+    python3 python3-pip python3-tk \
+    x11-xserver-utils \
+    git curl nano vim dos2unix \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# noVNC 설치
+RUN git clone https://github.com/novnc/noVNC.git /noVNC && \
+    git clone https://github.com/novnc/websockify /noVNC/websockify && \
+    pip3 install /noVNC/websockify
+
+# FastAPI 설치
+RUN pip install fastapi uvicorn
+
+# VNC 비밀번호 설정 및 xstartup 구성
+RUN mkdir -p /root/.vnc && \
+    printf "%s\n%s\nn\n" "$VNC_PASSWORD" "$VNC_PASSWORD" | vncpasswd && \
+    echo -e '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' > /root/.vnc/xstartup && \
+    chmod +x /root/.vnc/xstartup
+
+# 앱 코드 복사 (현재 디렉토리 기준)
+WORKDIR /app
+COPY . /app
+
+# start.sh 실행 권한 부여
+RUN chmod +x /app/start.sh && dos2unix /app/start.sh
+
+EXPOSE 8000 ${VNC_PORT} ${NOVNC_PORT}
+
+CMD ["/app/start.sh"]

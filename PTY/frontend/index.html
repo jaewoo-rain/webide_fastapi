@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Run Python Turtle</title>
+  </head>
+  <body>
+    <h1>Python GUI 실행기</h1>
+    <textarea
+      id="code"
+      rows="15"
+      cols="80"
+      placeholder="여기에 turtle 코드를 작성하세요."
+    ></textarea>
+    <br />
+    <button onclick="submitCode()">실행</button>
+    <p id="result"></p>
+
+    <script>
+      async function submitCode() {
+        const code = document.getElementById("code").value;
+        document.getElementById("result").innerText = "코드 실행 중...";
+
+        try {
+          const response = await fetch("http://localhost:8000/run-gui", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
+          });
+
+          const data = await response.json();
+          if (data.status === "gui detected") {
+            document.getElementById("result").innerText =
+              "GUI 감지됨! 새 창으로 열립니다.";
+            window.open(data.novnc_url, "_blank");
+          } else {
+            document.getElementById("result").innerText =
+              "CLI 코드로 판단됨. GUI 없음.";
+          }
+        } catch (err) {
+          document.getElementById("result").innerText = "오류 발생: " + err;
+        }
+      }
+    </script>
+  </body>
+</html>
