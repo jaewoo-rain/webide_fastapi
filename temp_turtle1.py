@@ -58,5 +58,5 @@ screen.mainloop()
 
 """
 
-res = requests.post("http://localhost:5000/run", json={"code": code1})
+res = requests.post("http://localhost:8000/run-gui", json={"code": code1})
 print(res.json())
