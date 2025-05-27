@@ -18,23 +18,37 @@ docker_client = docker.from_env()
 DEFAULT_VNC_START = 10007
 DEFAULT_NOVNC_START = 6080
 MAX_TRIES = 10
-global DOCKER_NAME
+DOCKER_NAME = "docker-file"
 DOCKER_DISPLAY = ":1"
 
 # 기본 이미지 설정 파일, 다른 이미지 받으면 대체 됨
+# "이렇게 생긴 JSON을 기대해주세요"
+# { "image": "my-custom-image" } 이렇게 생긴것을 기대함함
+# BaseModel = 쿼리 같은것이 아니라 명시적으로 body 형태로 오도록 함
 class RunRequest(BaseModel):
     image: str = "docker-file"
 
 def get_used_host_ports():
     """현재 Docker가 할당 중인 호스트 포트 목록을 반환합니다."""
-    used = set()
-    for container in docker_client.containers.list(all=True):
-        ports = container.attrs.get('NetworkSettings', {}).get('Ports') or {}
+    used = set() # 포트 번호를 중복 없이 담기 위해 
+    for container in docker_client.containers.list(all=True): # 현재 실행 중인 컨테이너뿐 아니라, 정지(stopped) 상태인 컨테이너까지 전부 나열한 리스트
+        ports = container.attrs.get('NetworkSettings', {}).get('Ports') or {} # 컨테이너의 포트 바인딩 정보 꺼내기, 
+                                                                              # container.attrs["NetworkSettings"]["Ports"] 동일
         for bindings in ports.values():
             if bindings:
                 for bind in bindings:
                     host_port = int(bind.get('HostPort'))
                     used.add(host_port)
+                    """
+                    ports = {
+                                "10007/tcp": [
+                                    {"HostIp": "0.0.0.0", "HostPort": "32768"}
+                                ],
+                                "6080/tcp": None
+                            }
+                    ports.keys() → dict_keys(["10007/tcp", "6080/tcp"])
+                    ports.values() → dict_values([ [{"HostIp":...,"HostPort":"32768"}], None ])
+                    """
     return used
 
 
@@ -49,11 +63,11 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
         nport = novnc_start + offset
         if vport not in used and nport not in used:
             return vport, nport
-    raise RuntimeError(f"No free ports available after {max_tries} tries.")
+    raise RuntimeError(f"{max_tries}회 시도 안에 빈 포트가 없습니다 ")
 
-@app.post("/create")g
+@app.post("/create")
 def run_container(req: RunRequest):
-    global DOCKER_NAME    
+    # global DOCKER_NAME
     # 사용 가능한 포트 쌍 탐색
     try:
         vnc_port, novnc_port = find_free_ports(
@@ -63,7 +77,7 @@ def run_container(req: RunRequest):
         raise HTTPException(status_code=409, detail=str(e))
 
     container_name = f"webide-vnc-{uuid.uuid4().hex[:8]}"
-    DOCKER_NAME = container_name
+    # DOCKER_NAME = container_name
     try:
         container = docker_client.containers.run(
             req.image,
@@ -106,9 +120,30 @@ async def get_index():
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-@app.get("/main", response_class=HTMLResponse)
-def go_main():
-    return "index.h"
+
+
+
+
+import ast
+
+def is_turtle_code(source: str) -> bool:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        # 1) import turtle 또는 import turtle as t
+        if isinstance(node, ast.Import):
+            if any(alias.name == "turtle" for alias in node.names):
+                return True
+        # 2) from turtle import forward 등
+        if isinstance(node, ast.ImportFrom) and node.module == "turtle":
+            return True
+        # 3) 실제 turtle.<something>() 호출
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in ("turtle",):  
+                return True
+    return False
+
+
+
 # 2. "/run"은 코드 실행 처리
 @app.post("/run")
 async def run_code(request: Request):
@@ -119,13 +154,13 @@ async def run_code(request: Request):
 
     filename = "temp_turtle.py"
     local_path = os.path.join(os.getcwd(), filename)
+
+    utf8_header = "# -*- coding: utf-8 -*-\n"
+
     with open(local_path, "w") as f:
-        f.write(code)
+        f.write(utf8_header + code)
 
     remote_path = f"/tmp/{filename}"
-
-    # turtle 코드인지 확인
-    is_turtle = "import turtle" in code
 
     # 기존 프로세스 죽이기
     subprocess.run([
@@ -138,19 +173,43 @@ async def run_code(request: Request):
         "docker", "cp", local_path, f"{DOCKER_NAME}:{remote_path}"
     ])
 
-    if is_turtle:
-        subprocess.Popen([
-            "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
-            DOCKER_NAME, "python3", remote_path
-        ])
-        return {"status": "running", "type": "turtle"}
-    else:
-        result = subprocess.run([
-            "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
-            DOCKER_NAME, "python3", remote_path
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        output = result.stdout.decode() + result.stderr.decode()
-        return {"status": "done", "type": "text", "output": output}
+    # turtle 코드인지 확인
 
+    try:
+        if is_turtle_code(code):
+            # GUI 실행하기
+            subprocess.Popen([
+                "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
+                DOCKER_NAME, "python3", remote_path
+            ])
+            return JSONResponse(
+                status_code=200,
+                content= {"status": "running", "type": "turtle"}
+            )
+        else:
+            # CLI 실행하기
+            result = subprocess.run([
+                "docker", "exec",
+                DOCKER_NAME, "python3", remote_path
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            output = result.stdout.decode() + result.stderr.decode()
+            # return {"status": "done", "type": "text", "output": output}
+            return JSONResponse(
+                status_code=200,
+                content= {"status": "done", "type": "text", "output": output}
+            )
+    except Exception as e:
+        # 예외 메시지를 문자열로 변환
+        # return {"status": "done", "type": "text", "output": str(e)}
+
+        err_msg = str(e)
+        # 필요시 traceback도 붙일 수 있습니다:
+        import traceback; 
+        err_msg = traceback.format_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "type": "text", "output": err_msg}
+        )
 
