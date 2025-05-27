@@ -65,6 +65,9 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
             return vport, nport
     raise RuntimeError(f"{max_tries}회 시도 안에 빈 포트가 없습니다 ")
 
+"""
+사용자 입력 이미지 기반으로 컨테이너 생성 요청 API
+"""
 @app.post("/create")
 def run_container(req: RunRequest):
     # global DOCKER_NAME
@@ -147,8 +150,10 @@ def is_turtle_code(source: str) -> bool:
 async def run_code(request: Request):
     body = await request.json()
     code = body.get("code")
-    if not code:
-        return JSONResponse(content={"error": "No code provided"}, status_code=400)
+    container_name = body.get("container_name")
+
+    if not code or not container_name:
+        return JSONResponse(content={"error": "Code or container name missing"}, status_code=400)
 
     filename = "temp_turtle.py"
     local_path = os.path.join(os.getcwd(), filename)
