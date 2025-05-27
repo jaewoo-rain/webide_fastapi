@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-# 1. VNC 서버 실행
-vncserver :1 -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -rfbport ${VNC_PORT} -localhost no
+# VNC 서버 실행
+vncserver :1 -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH}
 
-# 2. noVNC 실행
-/noVNC/utils/novnc_proxy --vnc localhost:${VNC_PORT} --listen ${NOVNC_PORT} &
+# noVNC 실행
+/opt/noVNC/utils/launch.sh --vnc localhost:5901 --listen 6080
 
-# 3. FastAPI 서버 실행
-uvicorn main:app --host 0.0.0.0 --port 8000
+# 컨테이너는 여기서 대기 (무한 sleep)
+tail -f /dev/null

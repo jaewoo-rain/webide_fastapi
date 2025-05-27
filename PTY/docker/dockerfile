@@ -1,42 +1,49 @@
+# 1. 베이스 이미지
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VNC_PASSWORD=jaewoo \
+    DISPLAY=:1 \
     VNC_GEOMETRY=1024x768 \
-    VNC_DEPTH=24 \
-    VNC_PORT=5901 \
-    NOVNC_PORT=6080
+    VNC_DEPTH=24
 
-# 필수 패키지 설치
+# 2. 필수 패키지 설치
 RUN apt-get update && apt-get install -y \
-    tigervnc-standalone-server \
-    python3 python3-pip python3-tk \
-    x11-xserver-utils \
-    git curl nano vim dos2unix \
-    npm \
-    && rm -rf /var/lib/apt/lists/*
+    python3 python3-pip python3-tk python3-dev \
+    tigervnc-standalone-server x11vnc xvfb \
+    xterm wmctrl x11-utils curl git \
+    nano vim net-tools build-essential \
+    libx11-dev libxext-dev libxtst-dev libxrender-dev libxt-dev \
+    dos2unix && \
+    rm -rf /var/lib/apt/lists/*
 
-# noVNC 설치
-RUN git clone https://github.com/novnc/noVNC.git /noVNC && \
-    git clone https://github.com/novnc/websockify /noVNC/websockify && \
-    pip3 install /noVNC/websockify
+# 3. noVNC & websockify 설치
+WORKDIR /opt
+RUN git clone https://github.com/novnc/noVNC.git && \
+    cd noVNC && git checkout v1.2.0 && \
+    git clone https://github.com/novnc/websockify && \
+    cd websockify && pip3 install . --break-system-packages
 
-# FastAPI 설치
-RUN pip install fastapi uvicorn
-
-# VNC 비밀번호 설정 및 xstartup 구성
+# 4. VNC 설정
 RUN mkdir -p /root/.vnc && \
-    printf "%s\n%s\nn\n" "$VNC_PASSWORD" "$VNC_PASSWORD" | vncpasswd && \
-    echo -e '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' > /root/.vnc/xstartup && \
-    chmod +x /root/.vnc/xstartup
+    printf "%s\n%s\nn\n" "$VNC_PASSWORD" "$VNC_PASSWORD" | vncpasswd
 
-# 앱 코드 복사 (현재 디렉토리 기준)
-WORKDIR /app
-COPY . /app
+# 5. xstartup 설정
+RUN printf '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' > /root/.vnc/xstartup && chmod +x /root/.vnc/xstartup
 
-# start.sh 실행 권한 부여
-RUN chmod +x /app/start.sh && dos2unix /app/start.sh
+# 6. 실행 스크립트 복사
+COPY start.sh /opt/start.sh
+RUN dos2unix /opt/start.sh && chmod +x /opt/start.sh
 
-EXPOSE 8000 ${VNC_PORT} ${NOVNC_PORT}
+# 7. 포트 열기 (VNC, noVNC, CLI용 WebSocket용도 8001)
+EXPOSE 10007 6080 8001
 
-CMD ["/app/start.sh"]
+# 8. 컨테이너 시작 시 스크립트 실행
+CMD ["bash", "/opt/start.sh"]
+
+
+# docker build -t webide-vnc .
+
+# # 테스트 실행
+# docker run -d -p 6081:6080 -p 10001:10007 -p 8001:8001 --name webide-test webide-vnc
+
