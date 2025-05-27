@@ -18,7 +18,6 @@ docker_client = docker.from_env()
 DEFAULT_VNC_START = 10007
 DEFAULT_NOVNC_START = 6080
 MAX_TRIES = 10
-DOCKER_NAME = "docker-file"
 DOCKER_DISPLAY = ":1"
 
 # 기본 이미지 설정 파일, 다른 이미지 받으면 대체 됨
@@ -167,13 +166,13 @@ async def run_code(request: Request):
 
     # 기존 프로세스 죽이기
     subprocess.run([
-        "docker", "exec", DOCKER_NAME,
+        "docker", "exec", container_name,
         "pkill", "-f", f"python3 {remote_path}"
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 파일 복사
     subprocess.run([
-        "docker", "cp", local_path, f"{DOCKER_NAME}:{remote_path}"
+        "docker", "cp", local_path, f"{container_name}:{remote_path}"
     ])
 
     # turtle 코드인지 확인
@@ -183,7 +182,7 @@ async def run_code(request: Request):
             # GUI 실행하기
             subprocess.Popen([
                 "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
-                DOCKER_NAME, "python3", remote_path
+                container_name, "python3", remote_path
             ])
             return JSONResponse(
                 status_code=200,
@@ -193,7 +192,7 @@ async def run_code(request: Request):
             # CLI 실행하기
             result = subprocess.run([
                 "docker", "exec",
-                DOCKER_NAME, "python3", remote_path
+                container_name, "python3", remote_path
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             output = result.stdout.decode() + result.stderr.decode()

@@ -1,26 +1,22 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <link rel="icon" href="/favicon.ico" />
-  <title>Document</title>
+  <title>도커 컨테이너 시작</title>
 </head>
 <body>
+  <h1>도커 컨테이너 생성</h1>
   <button id="createProject">도커 만들기</button>
-  <a href="static/index.html">테스트 코드</a>
+
 
   <script>
     document.getElementById('createProject').addEventListener('click', async () => {
       try {
         const res = await fetch('/create', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            image: 'docker-file'
-          })
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: 'docker-file' })
         });
 
         if (!res.ok) {
@@ -31,9 +27,12 @@
         const data = await res.json();
         console.log('Container started:', data);
 
-        console.log('성공', data["novnc_port"])
-        // 성공하면 index.html로 이동
-        // window.location.href = 'static/index.html';
+        // index.html로 이동하며 컨테이너 정보 전달
+        const params = new URLSearchParams({
+          container_name: data.name,
+          novnc_port: data.novnc_port
+        });
+        window.location.href = `static/index.html?${params.toString()}`;
 
       } catch (err) {
         console.error('Error starting container:', err);

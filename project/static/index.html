@@ -1,65 +1,67 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-    <meta charset="UTF-8">
-    <title>Python 코드 실행기</title>
+  <meta charset="UTF-8" />
+  <title>Python 코드 실행기</title>
 </head>
 <body>
-    <h1>Python 코드 실행</h1>
+  <h1>Python 코드 실행</h1>
 
-    <textarea id="code" rows="20" cols="80" placeholder="여기에 코드를 작성하세요"></textarea>
-    <br><br>
-    <button onclick="runCode()">실행</button>
+  <textarea id="code" rows="20" cols="80" placeholder="여기에 코드를 작성하세요"></textarea>
+  <br><br>
+  <button onclick="runCode()">실행</button>
 
-    <h2>실행 결과</h2>
-    <pre id="output"></pre>
+  <h2>실행 결과</h2>
+  <pre id="output"></pre>
 
-    <h2>VNC 화면 (Turtle 코드일 때)</h2>
-    <!-- <iframe id="vnc" src="http://localhost:6080/vnc.html" width="1024" height="768" style="display:none;"></iframe> -->
-    <iframe id="vnc"   src="http://localhost:6080/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
-width="1024" height="768"  style="display:none;"></iframe>
+  <h2>VNC 화면 (Turtle 코드일 때)</h2>
+  <iframe id="vnc" width="1024" height="768" style="display:none;"></iframe>
 
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const containerName = urlParams.get('container_name');
+    const novncPort = urlParams.get('novnc_port');
 
-    <script>
-        async function runCode() {
-            const code = document.getElementById("code").value;
-            const output = document.getElementById("output");
-            const vnc = document.getElementById("vnc");
+    if (!containerName || !novncPort) {
+      alert("컨테이너 정보가 없습니다. 먼저 도커를 생성하세요.");
+    } else {
+      // VNC iframe src 동적으로 설정
+      document.getElementById("vnc").src =
+        `http://localhost:${novncPort}/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo`;
+    }
 
-            output.textContent = "실행 중...";
+    async function runCode() {
+    const code = document.getElementById("code").value;
+    const output = document.getElementById("output");
+    const vnc = document.getElementById("vnc");
 
-            const response = await fetch("/run", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ code: code })
-            });
+    output.textContent = "코드 실행 중...";
 
-            const result = await response.json();
+    const response = await fetch("/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+        code: code,
+        container_name: containerName
+        })
+    });
 
-            console.log(result)
+    const result = await response.json();
+    console.log(result);
 
-            if (result.status === "error") {
-                vnc.style.display = "none";
-                // output.textContent = "오류 발생:\n" + (res.error || JSON.stringify(res));
-                output.textContent = result.output;
+    if (result.status === "error") {
+        vnc.style.display = "none";
+        output.textContent = "오류 발생:\n" + result.output;
+    } else if (result.status === "running" && result.type === "gui") {
+        vnc.src = `http://localhost:${novncPort}/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo`;
+        vnc.style.display = "block";
+        output.textContent = "GUI 실행 중...";
+    } else {
+        vnc.style.display = "none";
+        output.textContent = result.output;
+    }
+    }
 
-            } else if(result.status === "running"){
-                if(result.type === "gui"){
-                    vnc.style.display = "block";
-                    output.textContent = result.output;  
-                }else if(result.type === "cli"){
-                    console.log("cli출력모드")
-                    vnc.style.display = "none";
-                    output.textContent = result.output;
-                }else{
-                    vnc.style.display = "none";
-                    output.textContent = result.output;
-                }
-              
-            } else {
-
-            }
-        }
-    </script>
+  </script>
 </body>
 </html>
