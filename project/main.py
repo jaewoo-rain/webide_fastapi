@@ -1,60 +1,70 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uuid
 import docker
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
+from datetime import datetime
+import ast
+import traceback
 
 app = FastAPI()
+docker_client = docker.from_env()
 
 # Static 폴더 등록
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-docker_client = docker.from_env()
+# 사전 정의된 컨테이너 목록 및 상태 (MVP용 인메모리)
+PREDEFINED_CONTAINERS = {
+    "python": [
+        {"id": "python-1", "port": 30001},
+        {"id": "python-2", "port": 30002},
+        {"id": "python-3", "port": 30003}
+    ],
+    "nodejs": [
+        {"id": "node-1", "port": 31001},
+        {"id": "node-2", "port": 31002}
+    ]
+}
 
-# 기본 포트 설정
+container_status = {
+    "python-1": {"status": "available", "user_id": None, "last_heartbeat": None},
+    "python-2": {"status": "available", "user_id": None, "last_heartbeat": None},
+    "python-3": {"status": "available", "user_id": None, "last_heartbeat": None},
+    "node-1": {"status": "available", "user_id": None, "last_heartbeat": None},
+    "node-2": {"status": "available", "user_id": None, "last_heartbeat": None},
+}
+
+# 기본 포트 설정 및 최대 시도 횟수
 DEFAULT_VNC_START = 10007
 DEFAULT_NOVNC_START = 6080
 MAX_TRIES = 10
 DOCKER_DISPLAY = ":1"
 
-# 기본 이미지 설정 파일, 다른 이미지 받으면 대체 됨
-# "이렇게 생긴 JSON을 기대해주세요"
-# { "image": "my-custom-image" } 이렇게 생긴것을 기대함함
-# BaseModel = 쿼리 같은것이 아니라 명시적으로 body 형태로 오도록 함
+# 요청 바디 모델: 이미지 이름
 class RunRequest(BaseModel):
     image: str = "docker-file"
 
-def get_used_host_ports():
-    """현재 Docker가 할당 중인 호스트 포트 목록을 반환합니다."""
-    used = set() # 포트 번호를 중복 없이 담기 위해 
-    for container in docker_client.containers.list(all=True): # 현재 실행 중인 컨테이너뿐 아니라, 정지(stopped) 상태인 컨테이너까지 전부 나열한 리스트
-        ports = container.attrs.get('NetworkSettings', {}).get('Ports') or {} # 컨테이너의 포트 바인딩 정보 꺼내기, 
-                                                                              # container.attrs["NetworkSettings"]["Ports"] 동일
+
+def get_used_host_ports() -> set[int]:
+    """
+    현재 Docker가 사용 중인 호스트 포트 번호 집합을 반환합니다.
+    """
+    used = set()
+    for container in docker_client.containers.list(all=True):
+        ports = container.attrs.get('NetworkSettings', {}).get('Ports') or {}
         for bindings in ports.values():
             if bindings:
                 for bind in bindings:
-                    host_port = int(bind.get('HostPort'))
-                    used.add(host_port)
-                    """
-                    ports = {
-                                "10007/tcp": [
-                                    {"HostIp": "0.0.0.0", "HostPort": "32768"}
-                                ],
-                                "6080/tcp": None
-                            }
-                    ports.keys() → dict_keys(["10007/tcp", "6080/tcp"])
-                    ports.values() → dict_values([ [{"HostIp":...,"HostPort":"32768"}], None ])
-                    """
+                    used.add(int(bind.get('HostPort')))
     return used
 
 
-def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
+def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int) -> tuple[int, int]:
     """
-    Docker의 사용 중인 포트를 피해서
-    사용 가능한 vnc/novnc 포트 쌍을 찾아 리턴합니다.
+    Docker에서 사용 중인 포트를 피해 사용 가능한 (vnc_port, novnc_port) 쌍을 찾아 반환합니다.
     """
     used = get_used_host_ports()
     for offset in range(max_tries):
@@ -62,24 +72,20 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int):
         nport = novnc_start + offset
         if vport not in used and nport not in used:
             return vport, nport
-    raise RuntimeError(f"{max_tries}회 시도 안에 빈 포트가 없습니다 ")
+    raise RuntimeError(f"{max_tries}회 시도 내에 빈 포트가 없습니다.")
 
-"""
-사용자 입력 이미지 기반으로 컨테이너 생성 요청 API
-"""
+
 @app.post("/create")
 def run_container(req: RunRequest):
-    # global DOCKER_NAME
-    # 사용 가능한 포트 쌍 탐색
+    """
+    사용자가 요청한 이미지로 새 컨테이너 생성 후 관련 정보 반환
+    """
     try:
-        vnc_port, novnc_port = find_free_ports(
-            DEFAULT_VNC_START, DEFAULT_NOVNC_START, MAX_TRIES
-        )
+        vnc_port, novnc_port = find_free_ports(DEFAULT_VNC_START, DEFAULT_NOVNC_START, MAX_TRIES)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
     container_name = f"webide-vnc-{uuid.uuid4().hex[:8]}"
-    # DOCKER_NAME = container_name
     try:
         container = docker_client.containers.run(
             req.image,
@@ -87,24 +93,55 @@ def run_container(req: RunRequest):
             name=container_name,
             ports={
                 f"{DEFAULT_VNC_START}/tcp": vnc_port,
-                f"{DEFAULT_NOVNC_START}/tcp": novnc_port
+                f"{DEFAULT_NOVNC_START}/tcp": novnc_port,
             },
-            restart_policy={"Name": "unless-stopped"}
+            restart_policy={"Name": "unless-stopped"},
         )
         return {
             "message": "Container started",
             "container_id": container.id,
             "name": container_name,
             "vnc_port": vnc_port,
-            "novnc_port": novnc_port
+            "novnc_port": novnc_port,
+            "image": req.image,
         }
     except docker.errors.APIError as e:
         raise HTTPException(status_code=500, detail=f"Docker API error: {e.explanation}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/assign")
+async def assign_container(req: RunRequest):
+    """
+    사전 정의된 컨테이너 중 사용 가능한 컨테이너를 사용자에게 할당
+    """
+    user_id = str(uuid.uuid4())  # 실제 서비스에선 인증된 사용자 ID로 대체 필요
+
+    for container in PREDEFINED_CONTAINERS.get(req.image, []):
+        cid = container["id"]
+        status = container_status.get(cid)
+        if status and status["status"] == "available":
+            container_status[cid] = {
+                "status": "busy",
+                "user_id": user_id,
+                "last_heartbeat": datetime.utcnow(),
+            }
+            return {
+                "assigned": True,
+                "container_id": cid,
+                "user_id": user_id,
+                "port": container["port"],
+            }
+
+    raise HTTPException(status_code=429, detail="No available container")
+
+
 @app.get("/status/{name}")
 def get_status(name: str):
+    """
+    컨테이너 이름으로 상태 조회
+    """
     try:
         container = docker_client.containers.get(name)
         return {"name": name, "status": container.status}
@@ -114,102 +151,107 @@ def get_status(name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-# 1. "/" 접속하면 static 폴더에 있는 index.html 읽어서 보내기
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
+    """
+    루트 경로 접속 시 static/home.html 반환
+    """
     with open("static/home.html", "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
 
-
-
-import ast
-
 def is_turtle_code(source: str) -> bool:
+    """
+    주어진 파이썬 코드가 turtle 모듈을 사용하는지 검사
+    """
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        # 1) import turtle 또는 import turtle as t
         if isinstance(node, ast.Import):
             if any(alias.name == "turtle" for alias in node.names):
                 return True
-        # 2) from turtle import forward 등
         if isinstance(node, ast.ImportFrom) and node.module == "turtle":
             return True
-        # 3) 실제 turtle.<something>() 호출
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in ("turtle",):
+            if node.value.id == "turtle":
                 return True
     return False
 
 
-# 2. "/run"은 코드 실행 처리
 @app.post("/run")
 async def run_code(request: Request):
+    """
+    클라이언트로부터 받은 코드와 컨테이너 정보로 해당 컨테이너 내에서 코드 실행 처리
+    """
     body = await request.json()
     code = body.get("code")
     container_name = body.get("container_name")
+    image = body.get("image")
 
     if not code or not container_name:
         return JSONResponse(content={"error": "Code or container name missing"}, status_code=400)
 
-    filename = "temp_turtle.py"
-    local_path = os.path.join(os.getcwd(), filename)
+    if image == "js-image":
+        filename = "temp.js"
+        local_path = os.path.join(os.getcwd(), filename)
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        remote_path = f"/tmp/{filename}"
+    else:
+        filename = "temp_turtle.py"
+        local_path = os.path.join(os.getcwd(), filename)
+        utf8_header = "# -*- coding: utf-8 -*-\n"
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(utf8_header + code)
+        remote_path = f"/tmp/{filename}"
 
-    utf8_header = "# -*- coding: utf-8 -*-\n"
-
-    with open(local_path, "w") as f:
-        f.write(utf8_header + code)
-
-    remote_path = f"/tmp/{filename}"
-
-    # 기존 프로세스 죽이기
-    subprocess.run([
-        "docker", "exec", container_name,
-        "pkill", "-f", f"python3 {remote_path}"
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 기존 프로세스 종료
+    subprocess.run(
+        ["docker", "exec", container_name, "pkill", "-f", f"python3 {remote_path}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     # 파일 복사
-    subprocess.run([
-        "docker", "cp", local_path, f"{container_name}:{remote_path}"
-    ])
-
-    # turtle 코드인지 확인
+    subprocess.run(["docker", "cp", local_path, f"{container_name}:{remote_path}"])
 
     try:
-        if is_turtle_code(code):
-            # GUI 실행하기
-            subprocess.Popen([
-                "docker", "exec", "-e", f"DISPLAY={DOCKER_DISPLAY}",
-                container_name, "python3", remote_path
-            ])
-            return JSONResponse(
-                status_code=200,
-                content= {"status": "running", "type": "gui"}
+        if image == "js-image":
+            # Node.js 코드 실행
+            result = subprocess.run(
+                ["docker", "exec", container_name, "node", remote_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-        else:
-            # CLI 실행하기
-            result = subprocess.run([
-                "docker", "exec",
-                container_name, "python3", remote_path
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
             output = result.stdout.decode() + result.stderr.decode()
-            # return {"status": "done", "type": "text", "output": output}
-            return JSONResponse(
-                status_code=200,
-                content= {"status": "done", "type": "text", "output": output}
-            )
-    except Exception as e:
-        # 예외 메시지를 문자열로 변환
-        # return {"status": "done", "type": "text", "output": str(e)}
+            return JSONResponse({"status": "done", "type": "text", "output": output})
 
-        err_msg = str(e)
-        # 필요시 traceback도 붙일 수 있습니다:
-        import traceback; 
+        else:
+            # 파이썬 코드 실행
+            if is_turtle_code(code):
+                # GUI용 turtle 코드 실행 (백그라운드)
+                subprocess.Popen(
+                    [
+                        "docker",
+                        "exec",
+                        "-e",
+                        f"DISPLAY={DOCKER_DISPLAY}",
+                        container_name,
+                        "python3",
+                        remote_path,
+                    ]
+                )
+                return JSONResponse({"status": "running", "type": "gui"})
+            else:
+                # CLI 실행
+                result = subprocess.run(
+                    ["docker", "exec", container_name, "python3", remote_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                output = result.stdout.decode() + result.stderr.decode()
+                return JSONResponse({"status": "done", "type": "text", "output": output})
+
+    except Exception:
         err_msg = traceback.format_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "type": "text", "output": err_msg}
-        )
+        return JSONResponse(status_code=500, content={"status": "error", "type": "text", "output": err_msg})
