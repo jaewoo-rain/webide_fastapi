@@ -42,4 +42,4 @@ EXPOSE 10007 6080 8001
 CMD ["bash", "/opt/start.sh"]
 
 # docker build -t webide-vnc .
-# docker run -d -p 6081:6080 -p 10001:10007 -p 8001:8001 --name webide-test webide-vnc
+# docker run -d -p 6081:6080 -p 10001:10007 -p 8001:8001 --name vnc-webide webide-vnc
