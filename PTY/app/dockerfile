@@ -29,7 +29,7 @@ RUN mkdir -p /root/.vnc && \
     printf "%s\n%s\nn\n" "$VNC_PASSWORD" "$VNC_PASSWORD" | vncpasswd
 
 # 5. xstartup 설정
-RUN printf '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' > /root/.vnc/xstartup && chmod +x /root/.vnc/xstartup
+RUN echo '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' > /root/.vnc/xstartup && chmod +x /root/.vnc/xstartup
 
 # 6. 실행 스크립트 복사
 COPY start.sh /opt/start.sh
@@ -41,9 +41,5 @@ EXPOSE 10007 6080 8001
 # 8. 컨테이너 시작 시 스크립트 실행
 CMD ["bash", "/opt/start.sh"]
 
-
 # docker build -t webide-vnc .
-
-# # 테스트 실행
 # docker run -d -p 6081:6080 -p 10001:10007 -p 8001:8001 --name webide-test webide-vnc
-

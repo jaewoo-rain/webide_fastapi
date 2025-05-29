@@ -1,15 +1,13 @@
-import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 import docker
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 app = FastAPI()
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,53 +16,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 정적 파일 서빙
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
-
-@app.get("/", include_in_schema=False)
-def serve_index():
-    return FileResponse("static/index.html")
-
-# Docker 클라이언트 & 컨테이너 이름
 client = docker.from_env()
 CONTAINER_NAME = "vnc-webide"
-
-# PTY 소켓 저장용
-pty_socket = None
 
 class CodeRequest(BaseModel):
     code: str
 
+# 정적 파일 설정
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+@app.get("/", include_in_schema=False)print("hello")
+def serve_index():
+    return FileResponse("static/index.html")
+
 @app.post("/run")
 def run_code(req: CodeRequest):
-    global pty_socket
-    if pty_socket is None:
-        raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
-
-    # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
-    # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
-    safe_code = req.code.replace("'", "'\"'\"'")
-    cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
-    try:
-        pty_socket.send(cmd.encode())
-    except Exception as e:
-        raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
-    return {"status": "sent to PTY"}
-
-@app.websocket("/ws")
-async def websocket_terminal(websocket: WebSocket):
-    global pty_socket
-    await websocket.accept()
-
-    # 컨테이너 가져오기
     try:
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
-        await websocket.send_text("❌ 컨테이너가 없습니다.")
+        return JSONResponse(status_code=404, content={"error": "Container not found"})
+
+    # 안전한 코드 저장 및 실행
+    safe_code = req.code.replace("'", "'\"'\"'")
+    exec_cmd = f"echo '{safe_code}' > /tmp/user_code.py && DISPLAY=:1 python3 /tmp/user_code.py"
+    container.exec_run(cmd=["bash", "-c", exec_cmd], detach=True)
+    return {"status": "started"}
+
+@app.websocket("/ws")
+async def websocket_terminal(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        container = client.containers.get(CONTAINER_NAME)
+    except docker.errors.NotFound:
+        await websocket.send_text("❌ 컨테이너 없음")
         await websocket.close()
         return
 
-    # bash PTY 세션 생성
+    # exec_create로 bash PTY 세션 생성
     exec_id = client.api.exec_create(
         container.id,
         cmd="/bin/bash",
@@ -72,14 +60,14 @@ async def websocket_terminal(websocket: WebSocket):
         stdin=True
     )["Id"]
 
-    # PTY 소켓 스트림 얻기
+    # exec_start로 소켓 연결
     sock = client.api.exec_start(
         exec_id,
         tty=True,
+        stream=False,
         socket=True
     )
-    # Windows의 NpipeSocket도 sock.recv/send 로 동작
-    pty_socket = sock  # 전역에 저장
+    # sock 자체로 recv/send 사용
 
     loop = asyncio.get_event_loop()
 
@@ -104,7 +92,5 @@ async def websocket_terminal(websocket: WebSocket):
             pass
         finally:
             sock.close()
-            pty_socket = None
 
-    # 읽기/쓰기 동시에 실행
     await asyncio.gather(read_from_container(), write_to_container())
