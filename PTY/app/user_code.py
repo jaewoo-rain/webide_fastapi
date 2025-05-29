@@ -25,7 +25,7 @@ class CodeRequest(BaseModel):
 # 정적 파일 설정
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
-@app.get("/", include_in_schema=False)print("hello")
+@app.get("/", include_in_schema=False)
 def serve_index():
     return FileResponse("static/index.html")
 
