@@ -235,7 +235,46 @@ async def run_code(request: Request):
                 status_code=200,
                 content= {"status": "running", "type": "cli", "output": output}
             )
+
+   
+    # # GUI 감지
+    # try:
+    #     gui_mode = is_gui_code(code)
+    # except SyntaxError as e:
+    #     return JSONResponse({"status":"error","type":"syntax","error":f"{e.msg} at line {e.lineno}"},status_code=400)
+
+    # # 실행 및 에러 캡처
+    # if gui_mode:
+    #     # 테스트 실행으로 오류 확인
+    #     try:
+    #         # 먼저 cli로 실행해봄
+    #         test = subprocess.run([
+    #             "docker","exec",DOCKER_NAME,"python3",remote_path
+    #         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    #     except subprocess.TimeoutExpired:
+    #         # 응답이 돌아오지 않아서 GUI가 실행되었다고 판단
+    #         subprocess.Popen([
+    #             "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #         ])
+    #         return JSONResponse({"status":"running","type":"gui"})
+
+    #     if test.returncode != 0: # 에러 발생(예: NameError)
+    #         return JSONResponse({"status":"error","type":"runtime","error":test.stderr.decode()},status_code=400)
         
+    #     # 정상 test.returncode == 0 이면 → 에러 없이 종료(즉 GUI를 띄우지 않았거나, “종료 가능한” 스크립트)
+    #     subprocess.Popen([
+    #         "docker","exec","-e",f"DISPLAY={DOCKER_DISPLAY}",DOCKER_NAME,"python3",remote_path
+    #     ])
+    #     return JSONResponse({"status":"running","type":"gui"})
+    # else:
+    #     # CLI 모드
+    #     result = subprocess.run([
+    #         "docker","exec",DOCKER_NAME,"python3",remote_path
+    #     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #     output = result.stdout.decode() + result.stderr.decode()
+    #     return JSONResponse({"status":"done","type":"text","output":output})
+
+
     except Exception as e:
         # 예외 메시지를 문자열로 변환
         err_msg = str(e)

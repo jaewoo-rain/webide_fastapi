@@ -51,7 +51,7 @@ RUN chmod +x /noVNC/start.sh
 EXPOSE ${VNC_PORT} ${NOVNC_PORT}
 
 # 9. 컨테이너 시작 시 스크립트 실행
-CMD ["./noVNC/start.sh"]
+CMD ["/opt/start.sh"]
 
 
 # # 1. 베이스 이미지

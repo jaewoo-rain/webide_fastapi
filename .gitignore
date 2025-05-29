@@ -5,5 +5,5 @@ pycache/
 *.so
 
 venv/
-
+.venv/
 __pycache__

@@ -46,6 +46,7 @@
           body: JSON.stringify({ image: selectedImage }),
         });
 
+<<<<<<< HEAD
         if (!response.ok) {
           const errorData = await response.json();
           throw new Error(errorData.detail || 'Unknown error');
@@ -53,6 +54,15 @@
 
         const data = await response.json();
         console.log('Container started:', data);
+=======
+            if (!res.ok) {
+              const error = await res.json();
+              throw new Error(error.detail || "Unknown error");
+            }
+
+            const data = await res.json();
+            console.log("Container started:", data);
+>>>>>>> 1c0e9d8963e0e0e0e05d87f0b2fd24e9c1e47b00
 
         // 컨테이너 정보를 URL 파라미터로 전달하며 index.html로 이동
         const params = new URLSearchParams({
