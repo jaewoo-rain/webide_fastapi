@@ -7,8 +7,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VNC_GEOMETRY=1024x768 \
     VNC_DEPTH=24
 
-# 2. 필수 패키지 설치
-RUN apt-get update && apt-get install -y \
+# 2. universe 리포지토리 추가 + 필수 패키지 설치
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository universe && apt-get update && \
+    apt-get install -y \
     python3 python3-pip python3-tk python3-dev \
     tigervnc-standalone-server x11vnc xvfb \
     xterm wmctrl x11-utils curl git \
@@ -35,11 +37,8 @@ RUN echo '#!/bin/bash\nxsetroot -solid grey\nwhile true; do sleep 1000; done\n' 
 COPY start.sh /opt/start.sh
 RUN dos2unix /opt/start.sh && chmod +x /opt/start.sh
 
-# 7. 포트 열기 (VNC, noVNC, CLI용 WebSocket용도 8001)
+# 7. 포트 열기
 EXPOSE 10007 6080 8001
 
-# 8. 컨테이너 시작 시 스크립트 실행
+# 8. 시작 명령
 CMD ["bash", "/opt/start.sh"]
-
-# docker build -t webide-vnc .
-# docker run -d -p 6081:6080 -p 10001:10007 -p 8001:8001 --name vnc-webide webide-vnc

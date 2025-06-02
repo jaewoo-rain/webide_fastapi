@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>WebIDE - 고정 컨테이너 실행</title>
+  <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+    }
+    textarea {
+      width: 100%;
+      height: 200px;
+      font-family: monospace;
+    }
+    #gui-frame {
+      width: 100%;
+      height: 700px;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    #terminal {
+      height: 300px;
+      width: 100%;
+      background: #000;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h2>🧑‍💻 WebIDE (vnc-webide)</h2>
+  <textarea id="code" placeholder="여기에 Python 코드를 입력하세요..."></textarea>
+  <br>
+  <button onclick="runCode()">💥 코드 실행</button>
+
+  <h3>💻 CLI 출력</h3>
+  <div id="terminal"></div>
+
+  <h3>🪟 GUI 출력 (VNC)</h3>
+  <iframe id="gui-frame" src="http://210.117.181.91:6081/vnc.html?autoconnect=true&resize=remote&password=jaewoo"></iframe>
+  
+
+  <script>
+    const term = new Terminal();
+    term.open(document.getElementById("terminal"));
+
+    const ws = new WebSocket("ws://210.117.181.91:10011/ws");
+
+
+    ws.onopen = () => {
+      term.write("\u{1F7E2} 연결 성공. bash 명령을 입력하세요.\r\n");
+      term.onData(data => {
+        ws.send(data);
+      });
+    };
+
+    ws.onmessage = (event) => {
+      term.write(event.data);
+    };
+
+    ws.onclose = () => {
+      term.write("\r\n\u{1F534} 연결 종료\r\n");
+    };
+
+    async function runCode() {
+      const code = document.getElementById("code").value;
+      await fetch("http://210.117.181.91:10011/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: code })
+      });
+    }
+  </script>
+</body>
+</html>

@@ -35,28 +35,45 @@ pty_socket = None
 class CodeRequest(BaseModel):
     code: str
 
+
+
 @app.post("/run")
-def run_code(req: CodeRequest):
+async def run_code(req: CodeRequest):
     global pty_socket
     if pty_socket is None:
         raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
+    
+    # 기존 코드 죽이기기
+    try: # 주어진 이름의 도커 컨테이너 가져오기
+        container = client.containers.get(CONTAINER_NAME)
+    except docker.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": "Container not found"})
+    container.exec_run("pkill -f /tmp/user_code.py")
 
-    # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
-    # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
+
     safe_code = req.code.replace("'", "'\"'\"'")
     cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
+
     try:
-        pty_socket.send(cmd.encode())
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            pty_socket._sock.send,  # ✅ ._sock 확실히 사용
+            cmd.encode()
+        )
     except Exception as e:
+        print(f"[run_code] 에러: {e}")
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
+
     return {"status": "sent to PTY"}
+
+
+
 
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
     global pty_socket
-    await websocket.accept()
+    await websocket.accept()  # ✅ 수락은 잘 되어 있음
 
-    # 컨테이너 가져오기
     try:
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
@@ -64,7 +81,6 @@ async def websocket_terminal(websocket: WebSocket):
         await websocket.close()
         return
 
-    # bash PTY 세션 생성
     exec_id = client.api.exec_create(
         container.id,
         cmd="/bin/bash",
@@ -72,26 +88,26 @@ async def websocket_terminal(websocket: WebSocket):
         stdin=True
     )["Id"]
 
-    # PTY 소켓 스트림 얻기
     sock = client.api.exec_start(
         exec_id,
         tty=True,
         socket=True
     )
-    # Windows의 NpipeSocket도 sock.recv/send 로 동작
-    pty_socket = sock  # 전역에 저장
+    pty_socket = sock
 
     loop = asyncio.get_event_loop()
 
     async def read_from_container():
         try:
             while True:
-                data = await loop.run_in_executor(None, sock.recv, 1024)
+               # data = await loop.run_in_executor(None, sock.recv, 1024)
+                data = await loop.run_in_executor(None, sock._sock.recv, 1024)
+
                 if not data:
                     break
                 await websocket.send_text(data.decode(errors="ignore"))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[read] 예외: {e}")
         finally:
             await websocket.close()
 
@@ -99,12 +115,26 @@ async def websocket_terminal(websocket: WebSocket):
         try:
             while True:
                 msg = await websocket.receive_text()
-                await loop.run_in_executor(None, sock.send, msg.encode())
-        except WebSocketDisconnect:
-            pass
-        finally:
-            sock.close()
-            pty_socket = None
+               # await loop.run_in_executor(None, sock.send, msg.encode())
+                await loop.run_in_executor(None, sock._sock.send, msg.encode())
 
-    # 읽기/쓰기 동시에 실행
-    await asyncio.gather(read_from_container(), write_to_container())
+        except WebSocketDisconnect:
+            print("🔌 클라이언트 WebSocket 연결 종료")
+        except RuntimeError as e:
+            print(f"[write] RuntimeError: {e}")
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            pty_socket = None
+            await websocket.close()
+
+    try:
+        await asyncio.gather(
+            read_from_container(),
+            write_to_container()
+        )
+    except Exception as e:
+        print(f"[main] gather 예외 발생: {e}")
+        await websocket.close()
