@@ -77,30 +77,15 @@ def find_free_ports(vnc_start: int, novnc_start: int, max_tries: int) -> tuple[i
 
 @app.post("/create")
 def run_container(req: RunRequest):
-<<<<<<< HEAD
     """
     사용자가 요청한 이미지로 새 컨테이너 생성 후 관련 정보 반환
     """
     try:
         vnc_port, novnc_port = find_free_ports(DEFAULT_VNC_START, DEFAULT_NOVNC_START, MAX_TRIES)
-=======
-    # global DOCKER_NAME    
-    # 사용 가능한 포트 쌍 탐색
-    try:
-        vnc_port, novnc_port = find_free_ports(
-            DEFAULT_VNC_START, DEFAULT_NOVNC_START, MAX_TRIES
-        )
-        DEFAULT_NOVNC_START = novnc_port
-        print(vnc_port, novnc_port)
->>>>>>> 1c0e9d8963e0e0e0e05d87f0b2fd24e9c1e47b00
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
     container_name = f"webide-vnc-{uuid.uuid4().hex[:8]}"
-<<<<<<< HEAD
-=======
-    DOCKER_NAME = container_name
->>>>>>> 1c0e9d8963e0e0e0e05d87f0b2fd24e9c1e47b00
     try:
         container = docker_client.containers.run(
             req.image,
