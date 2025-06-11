@@ -75,8 +75,8 @@ async def websocket_terminal(websocket: WebSocket):
 
     exec_id = client.api.exec_create(
         container.id,
-        # cmd="/bin/bash",
-        cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"], # 가상환경에서 실행하기
+        cmd="/bin/bash",
+        # cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"], # 가상환경에서 실행하기
         tty=True,
         stdin=True
     )["Id"]
