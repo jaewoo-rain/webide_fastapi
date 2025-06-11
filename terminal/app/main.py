@@ -1,4 +1,5 @@
 import os
+import time
 import docker
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -18,6 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Docker 클라이언트 & 컨테이너 이름
+client = docker.from_env()
+CONTAINER_NAME = "vnc-webide"
+
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
@@ -25,15 +30,12 @@ app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 def serve_index():
     return FileResponse("static/index.html")
 
-# Docker 클라이언트 & 컨테이너 이름
-client = docker.from_env()
-CONTAINER_NAME = "vnc-webide"
-
-# PTY 소켓 저장용
-pty_socket = None
 
 class CodeRequest(BaseModel):
     code: str
+
+# PTY 소켓 저장용
+pty_socket = None
 
 @app.post("/run")
 def run_code(req: CodeRequest):
@@ -53,14 +55,33 @@ def run_code(req: CodeRequest):
     cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
     try:
         pty_socket.send(cmd.encode())
+        
+        # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
+        for _ in range(5):
+            check = container.exec_run( 
+                cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' && echo yes || echo no"]
+            )
+            # 루트 트리에 GUI 창이 존재하는지 체크
+            if b"yes" in check.output:
+                return {
+                    "mode": "gui",
+                    "url": "http://localhost:6081/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
+                }
+            time.sleep(0.2)
+
+        # CLI 모드 결과 
+        result = container.exec_run(cmd=["bash", "-c", "cat /tmp/out.log"])
+        return {
+            "mode": "cli",
+            "output": result.output.decode(errors="ignore")
+        }
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
-    return {"status": "sent to PTY"}
 
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
     global pty_socket
-    await websocket.accept()  # ✅ 수락은 잘 되어 있음
+    await websocket.accept()  # 수락락
 
     try:
         container = client.containers.get(CONTAINER_NAME)
