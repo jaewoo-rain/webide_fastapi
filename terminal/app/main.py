@@ -60,18 +60,23 @@ def run_code(req: CodeRequest):
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
     global pty_socket
-    await websocket.accept()  # ✅ 수락은 잘 되어 있음
+    await websocket.accept()  # 수락은 잘 되어 있음
 
     try:
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
-        await websocket.send_text("❌ 컨테이너가 없습니다.")
+        await websocket.send_text("컨테이너가 없습니다.")
         await websocket.close()
         return
 
+    # 가상환경 만들기
+    venv_path = "/tmp/user_venv"
+    container.exec_run(f"python3 -m venv {venv_path}")
+
     exec_id = client.api.exec_create(
         container.id,
-        cmd="/bin/bash",
+        # cmd="/bin/bash",
+        cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"], # 가상환경에서 실행하기
         tty=True,
         stdin=True
     )["Id"]
