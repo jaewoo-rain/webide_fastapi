@@ -1,4 +1,5 @@
 import os
+import socket
 import time
 import docker
 import asyncio
@@ -7,6 +8,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.websockets import WebSocketState
+import socket
 
 app = FastAPI()
 
@@ -22,6 +25,13 @@ app.add_middleware(
 # Docker 클라이언트 & 컨테이너 이름
 client = docker.from_env()
 CONTAINER_NAME = "vnc-webide"
+venv_path = "/tmp/user_venv" # 나중에 동적으로 이름 바꿔야하나?
+
+# PTY 소켓 저장용
+pty_socket = None
+
+class CodeRequest(BaseModel):
+    code: str
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -31,13 +41,15 @@ def serve_index():
     return FileResponse("static/index.html")
 
 
-class CodeRequest(BaseModel):
-    code: str
-
-# PTY 소켓 저장용
-pty_socket = None
-
-venv_path = "/tmp/user_venv"
+# 안전한 socket 추출 함수
+def get_sendable_socket(sock):
+    if hasattr(sock, "send") and hasattr(sock, "recv"):
+        return sock
+    elif hasattr(sock, "_sock") and hasattr(sock._sock, "send"):
+        return sock._sock
+    else:
+        raise RuntimeError("send 가능한 소켓이 없습니다.")
+    
 
 @app.post("/run")
 def run_code(req: CodeRequest):
@@ -49,28 +61,25 @@ def run_code(req: CodeRequest):
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
         return JSONResponse(status_code=404, content={"error": "Container not found"})
+    
+    # 기존의 것 들 종료
     container.exec_run("pkill -f /tmp/user_code.py")
 
     # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
     # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
     safe_code = req.code.replace("'", "'\"'\"'")
-
     
     # # 터미널 더 깔끔하게 사용하기 위해서는  아래 주석 처리된걸로 사용하기
     # cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
 
-    cmd = f"echo '{safe_code}' > /tmp/user_code.py && {venv_path}/bin/python /tmp/user_code.py\n"
-
-
-    # 1. 코드 저장 따로 수행
-    # container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
-    # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
-    # pty_socket.send(b"python3 /tmp/user_code.py\n")
-
-
-
     try:
-        pty_socket.send(cmd.encode())
+        # pty_socket.send(cmd.encode())
+
+        # 깔끔하기 위한 코드 작성
+        # 1. 코드 저장 따로 수행
+        container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
+        # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
+        pty_socket.send(b"python3 /tmp/user_code.py\n")
 
         # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
         for _ in range(5):
@@ -94,7 +103,6 @@ def run_code(req: CodeRequest):
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
 
-
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
     global pty_socket
@@ -107,8 +115,12 @@ async def websocket_terminal(websocket: WebSocket):
         await websocket.close()
         return
 
-    # 가상환경 없으면 생성
-    container.exec_run(f"python3 -m venv {venv_path}")
+    # # 가상환경 없으면 생성
+    # check = container.exec_run(f"test -f {venv_path}/bin/activate && echo OK || echo NO")
+    # if b"NO" in check.output:
+    #     result = container.exec_run(f"python3 -m venv {venv_path}")
+    #     print("venv 생성 로그:", result.output.decode())
+
 
     # tty와 stdin을 통해 터미널 입출력 가능
     # /bin/bash 셸을 새로운 프로세스로 실행하고, 그 실행 ID를 얻는 명령
@@ -117,7 +129,6 @@ async def websocket_terminal(websocket: WebSocket):
         container.id,
         # cmd="/bin/bash", # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
         cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"],
-
         tty=True, 
         stdin=True  # 표준 입력을 받을 수 있게 하겠다
     )["Id"] # exec 세션의 고유 ID
@@ -130,7 +141,7 @@ async def websocket_terminal(websocket: WebSocket):
     )
 
     # 현재 소켓 저장 -> run 함수 실행을 위해 전역으로 다룸
-    pty_socket = sock
+    pty_socket = get_sendable_socket(sock)
 
     # 현재 비동기 루프(이벤트 루프)를 가져옴. 여기에 blocking 작업을 offload할 때 사용.
     loop = asyncio.get_event_loop()
@@ -139,14 +150,17 @@ async def websocket_terminal(websocket: WebSocket):
     async def read_from_container():
         try:
             while True:
-                data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
-                # data = await loop.run_in_executor(None, sock._sock.recv, 1024)
-
-                if not data:
-                    break
-                await websocket.send_text(data.decode(errors="ignore"))
+                try:
+                    data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
+                    if not data:
+                        break
+                    await websocket.send_text(data.decode(errors="ignore"))
+                except socket.timeout: # 타임아웃 되더라도 계속 실행함
+                    print("[read] recv timed out, but continuing...")
+                    continue
         except Exception as e:
             print(f"[read] 예외: {e}")
+
 
 
     # 데이터를 컨테이너에게 보내기
@@ -177,4 +191,5 @@ async def websocket_terminal(websocket: WebSocket):
         except Exception as e:
             print(f"소켓 종료 실패: {e}")
         pty_socket = None
-        await websocket.close()
+        if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
+            await websocket.close()

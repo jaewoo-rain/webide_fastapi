@@ -19,12 +19,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #     dos2unix && \
 #     rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends python3-venv\
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tigervnc-standalone-server tightvncserver \
     x11-xserver-utils \
     x11-utils \
     nano vim curl git \
-    python3-pip python3-tk \
+    python3 python3-pip python3-venv python3-tk python3-wxgtk4.0 \
     python3-wxgtk4.0 \
     dos2unix && \
     rm -rf /var/lib/apt/lists/*
