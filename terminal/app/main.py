@@ -1,4 +1,5 @@
 import os
+import socket
 import time
 import docker
 import asyncio
@@ -7,6 +8,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.websockets import WebSocketState
+import socket
 
 app = FastAPI()
 
@@ -22,6 +25,13 @@ app.add_middleware(
 # Docker 클라이언트 & 컨테이너 이름
 client = docker.from_env()
 CONTAINER_NAME = "vnc-webide"
+venv_path = "/tmp/user_venv" # 나중에 동적으로 이름 바꿔야하나?
+
+# PTY 소켓 저장용
+pty_socket = None
+
+class CodeRequest(BaseModel):
+    code: str
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -31,11 +41,15 @@ def serve_index():
     return FileResponse("static/index.html")
 
 
-class CodeRequest(BaseModel):
-    code: str
-
-# PTY 소켓 저장용
-pty_socket = None
+# 안전한 socket 추출 함수
+def get_sendable_socket(sock):
+    if hasattr(sock, "send") and hasattr(sock, "recv"):
+        return sock
+    elif hasattr(sock, "_sock") and hasattr(sock._sock, "send"):
+        return sock._sock
+    else:
+        raise RuntimeError("send 가능한 소켓이 없습니다.")
+    
 
 @app.post("/run")
 def run_code(req: CodeRequest):
@@ -47,15 +61,26 @@ def run_code(req: CodeRequest):
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
         return JSONResponse(status_code=404, content={"error": "Container not found"})
+    
+    # 기존의 것 들 종료
     container.exec_run("pkill -f /tmp/user_code.py")
 
     # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
     # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
     safe_code = req.code.replace("'", "'\"'\"'")
-    cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
+    
+    # # 터미널 더 깔끔하게 사용하기 위해서는  아래 주석 처리된걸로 사용하기
+    # cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
+
     try:
-        pty_socket.send(cmd.encode())
-        
+        # pty_socket.send(cmd.encode())
+
+        # 깔끔하기 위한 코드 작성
+        # 1. 코드 저장 따로 수행
+        container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
+        # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
+        pty_socket.send(b"python3 /tmp/user_code.py\n")
+
         # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
         for _ in range(5):
             check = container.exec_run( 
@@ -70,10 +95,10 @@ def run_code(req: CodeRequest):
             time.sleep(0.2)
 
         # CLI 모드 결과 
-        result = container.exec_run(cmd=["bash", "-c", "cat /tmp/out.log"])
+        # result = container.exec_run(cmd=["bash", "-c", "cat /tmp/out.log"])
         return {
             "mode": "cli",
-            "output": result.output.decode(errors="ignore")
+            # "output": result.output.decode(errors="ignore")
         }
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
@@ -81,74 +106,90 @@ def run_code(req: CodeRequest):
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
     global pty_socket
-    await websocket.accept()  # 수락은 잘 되어 있음
+    await websocket.accept()  # 수락
 
     try:
         container = client.containers.get(CONTAINER_NAME)
     except docker.errors.NotFound:
-        await websocket.send_text("컨테이너가 없습니다.")
+        await websocket.send_text(" 컨테이너가 없습니다.")
         await websocket.close()
         return
 
-    # 가상환경 만들기
-    venv_path = "/tmp/user_venv"
-    container.exec_run(f"python3 -m venv {venv_path}")
+    # # 가상환경 없으면 생성
+    # check = container.exec_run(f"test -f {venv_path}/bin/activate && echo OK || echo NO")
+    # if b"NO" in check.output:
+    #     result = container.exec_run(f"python3 -m venv {venv_path}")
+    #     print("venv 생성 로그:", result.output.decode())
 
-    exec_id = client.api.exec_create(
+
+    # tty와 stdin을 통해 터미널 입출력 가능
+    # /bin/bash 셸을 새로운 프로세스로 실행하고, 그 실행 ID를 얻는 명령
+    # client.api.exec_create(...) = 컨테이너 안에서 새로운 프로세스를 실행할 준비
+    exec_id = client.api.exec_create( # 실제 실행을 하지는 않고, 실행 준비만 하고 exec ID를 생성해줌
         container.id,
-        cmd="/bin/bash",
-        # cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"], # 가상환경에서 실행하기
-        tty=True,
-        stdin=True
-    )["Id"]
+        # cmd="/bin/bash", # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
+        cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"],
+        tty=True, 
+        stdin=True  # 표준 입력을 받을 수 있게 하겠다
+    )["Id"] # exec 세션의 고유 ID
 
+    # exec_id을 이용해서 실행, sock은 바이너리 데이터 입출력을 위한 소켓 객체
     sock = client.api.exec_start(
         exec_id,
         tty=True,
         socket=True
     )
-    pty_socket = sock
 
+    # 현재 소켓 저장 -> run 함수 실행을 위해 전역으로 다룸
+    pty_socket = get_sendable_socket(sock)
+
+    # 현재 비동기 루프(이벤트 루프)를 가져옴. 여기에 blocking 작업을 offload할 때 사용.
     loop = asyncio.get_event_loop()
 
+    # 데이터를 클라이언트에게 보내기기
     async def read_from_container():
         try:
             while True:
-                data = await loop.run_in_executor(None, sock.recv, 1024)
-                # data = await loop.run_in_executor(None, sock._sock.recv, 1024)
-
-                if not data:
-                    break
-                await websocket.send_text(data.decode(errors="ignore"))
+                try:
+                    data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
+                    if not data:
+                        break
+                    await websocket.send_text(data.decode(errors="ignore"))
+                except socket.timeout: # 타임아웃 되더라도 계속 실행함
+                    print("[read] recv timed out, but continuing...")
+                    continue
         except Exception as e:
             print(f"[read] 예외: {e}")
-        finally:
-            await websocket.close()
 
+
+
+    # 데이터를 컨테이너에게 보내기
     async def write_to_container():
         try:
             while True:
                 msg = await websocket.receive_text()
-                await loop.run_in_executor(None, sock.send, msg.encode())
+                await loop.run_in_executor(None, sock.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달달
                 # await loop.run_in_executor(None, sock._sock.send, msg.encode())
 
         except WebSocketDisconnect:
             print("🔌 클라이언트 WebSocket 연결 종료")
         except RuntimeError as e:
             print(f"[write] RuntimeError: {e}")
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            pty_socket = None
-            await websocket.close()
+
 
     try:
-        await asyncio.gather(
+        await asyncio.gather(  # 읽기, 쓰기 병행 실행행
             read_from_container(),
             write_to_container()
         )
     except Exception as e:
         print(f"[main] gather 예외 발생: {e}")
         await websocket.close()
+    finally:
+        try:
+            sock.close()
+        except Exception as e:
+            print(f"소켓 종료 실패: {e}")
+        pty_socket = None
+        if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
+            await websocket.close()
