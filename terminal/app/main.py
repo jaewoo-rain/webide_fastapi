@@ -35,11 +35,17 @@ class CodeRequest(BaseModel):
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
 
 @app.get("/", include_in_schema=False)
 def serve_index():
     return FileResponse("static/index.html")
 
+
+
+@app.get("/frontend")
+def read_index():
+    return FileResponse("frontend/dist/index.html")
 
 # 안전한 socket 추출 함수
 def get_sendable_socket(sock):
@@ -69,13 +75,8 @@ def run_code(req: CodeRequest):
     # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
     safe_code = req.code.replace("'", "'\"'\"'")
     
-    # # 터미널 더 깔끔하게 사용하기 위해서는  아래 주석 처리된걸로 사용하기
-    # cmd = f"echo '{safe_code}' > /tmp/user_code.py && python3 /tmp/user_code.py\n"
 
     try:
-        # pty_socket.send(cmd.encode())
-
-        # 깔끔하기 위한 코드 작성
         # 1. 코드 저장 따로 수행
         container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
         # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
@@ -184,7 +185,7 @@ async def websocket_terminal(websocket: WebSocket):
         )
     except Exception as e:
         print(f"[main] gather 예외 발생: {e}")
-        await websocket.close()
+        # await websocket.close()
     finally:
         try:
             sock.close()
