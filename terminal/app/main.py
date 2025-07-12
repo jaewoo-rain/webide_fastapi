@@ -32,6 +32,8 @@ pty_socket = None
 
 class CodeRequest(BaseModel):
     code: str
+    tree: object
+    fileMap: object
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -55,10 +57,41 @@ def get_sendable_socket(sock):
         return sock._sock
     else:
         raise RuntimeError("send 가능한 소켓이 없습니다.")
-    
+
+path = []
+
+def 파일생성(tree, fileMap):
+    if tree["type"] == "folder":
+        folder_name = fileMap[tree["id"]]["name"]
+        print("-- \n경로:", "/".join(path))
+        print(f"+ 폴더생성 {folder_name}")
+        path.append(folder_name)
+
+        if tree.get("children"):
+            for node in tree["children"]:
+                파일생성(node, fileMap)
+        path.pop()  
+
+    elif tree["type"] == "file":
+        file_name = fileMap[tree["id"]]["name"]
+        content = fileMap[tree["id"]].get("content", "")
+        print("-- \n경로:", "/".join(path))
+        print(f"+ 파일생성 {file_name} (내용: {content})")
+        path.append(file_name)
+        path.pop()  
+
 
 @app.post("/run")
 def run_code(req: CodeRequest):
+    tree = req.tree
+    fileMap = req.fileMap
+    # print(req)
+    # print(tree["id"])
+    path = 파일생성(tree, fileMap)
+    print(path)
+
+
+
     global pty_socket
     if pty_socket is None:
         raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
