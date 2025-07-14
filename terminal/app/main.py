@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 import socket
 
+
 app = FastAPI()
 
 # CORS 설정
@@ -34,6 +35,7 @@ class CodeRequest(BaseModel):
     code: str
     tree: object
     fileMap: object
+    run_code: str
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -58,38 +60,60 @@ def get_sendable_socket(sock):
     else:
         raise RuntimeError("send 가능한 소켓이 없습니다.")
 
-path = []
+path = [] # 전역변수 말고 지역변수로 바꿔야함 아니면 안에 내용을 지우는 코드를 넣던지
+    
+def 파일생성(container, tree, fileMap, run_code, base_path="/opt", path=None):
+    if path is None:
+        path = []
 
-def 파일생성(tree, fileMap):
+    result = None  # 최종 실행 파일 경로 저장
+
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
         print("-- \n경로:", "/".join(path))
-        print(f"+ 폴더생성 {folder_name}")
         path.append(folder_name)
+        full_path = base_path + "/" + "/".join(path)
 
-        if tree.get("children"):
-            for node in tree["children"]:
-                파일생성(node, fileMap)
-        path.pop()  
+        print(f"+ 폴더생성 {folder_name}")
+        container.exec_run(cmd=["mkdir", "-p", full_path])
+
+        for node in tree.get("children", []):
+            sub_result = 파일생성(container, node, fileMap, run_code, base_path, path)
+            if sub_result:
+                result = sub_result  # 하위 트리에서 실행파일 발견 시 저장
+
+        path.pop()
 
     elif tree["type"] == "file":
         file_name = fileMap[tree["id"]]["name"]
         content = fileMap[tree["id"]].get("content", "")
         print("-- \n경로:", "/".join(path))
-        print(f"+ 파일생성 {file_name} (내용: {content})")
-        path.append(file_name)
-        path.pop()  
+        print(f"+ 파일생성 {file_name} (내용: {content}) (id: {tree['id']})")
+
+        full_path = base_path + "/" + "/".join(path + [file_name])
+
+        if run_code == tree["id"]:
+            print("=====실행파일====")
+            print(full_path)
+            print("=================")
+            result = full_path  # 실행파일 경로 저장
+
+        safe_content = content.replace("'", "'\"'\"'")
+        container.exec_run(cmd=["bash", "-c", f"echo '{safe_content}' > '{full_path}'"])
+
+    return result  # 실행 파일 경로 반환
+
+
 
 
 @app.post("/run")
 def run_code(req: CodeRequest):
     tree = req.tree
     fileMap = req.fileMap
-    # print(req)
-    # print(tree["id"])
-    path = 파일생성(tree, fileMap)
-    print(path)
-
+    run_code = req.run_code
+    # print(f"run_code: {run_code}")
+    # print(f"fileMap: {fileMap}")
+    # print(f"tree: {tree}")
 
 
     global pty_socket
@@ -110,10 +134,18 @@ def run_code(req: CodeRequest):
     
 
     try:
+
+        # 워크페이스 초기화
+        container.exec_run("rm -rf /opt/workspace && mkdir -p /opt/workspace")
+        path = 파일생성(container, tree, fileMap,run_code, base_path="/opt/workspace")
+        print(f"path: {path}")
+
         # 1. 코드 저장 따로 수행
         container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
         # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
-        pty_socket.send(b"python3 /tmp/user_code.py\n")
+        # pty_socket.send(b"python3 /tmp/user_code.py\n")
+        pty_socket.send(f"python3 {path}\n".encode())
+
 
         # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
         for _ in range(5):
