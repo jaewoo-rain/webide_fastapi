@@ -41,3 +41,21 @@ screen.exitonclick()
 
 # # 화면에 출력
 # plt.show()
+
+
+
+
+#========================================================================
+# # src/util.py
+
+# message = "src/util.py에서 온 메시지입니다!"
+
+# def say_hello(name):
+#     return f"{name}님, 환영합니다!"
+
+
+# # main.py
+# from src import utils
+
+# print(utils.message)
+# print(utils.say_hello("재우"))

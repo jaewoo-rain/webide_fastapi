@@ -60,6 +60,8 @@ def get_sendable_socket(sock):
     else:
         raise RuntimeError("send 가능한 소켓이 없습니다.")
 
+
+
 path = [] # 전역변수 말고 지역변수로 바꿔야함 아니면 안에 내용을 지우는 코드를 넣던지
     
 def 파일생성(container, tree, fileMap, run_code, base_path="/opt", path=None):
