@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 import socket
-
+from uuid import uuid4
 
 app = FastAPI()
 
@@ -27,6 +27,8 @@ app.add_middleware(
 client = docker.from_env()
 CONTAINER_NAME = "vnc-webide"
 venv_path = "/tmp/user_venv" # 나중에 동적으로 이름 바꿔야하나?
+
+sessions = {} # sid -> PTY socket
 
 # PTY 소켓 저장용
 pty_socket = None
@@ -60,63 +62,13 @@ def get_sendable_socket(sock):
     else:
         raise RuntimeError("send 가능한 소켓이 없습니다.")
 
-
-
 path = [] # 전역변수 말고 지역변수로 바꿔야함 아니면 안에 내용을 지우는 코드를 넣던지
     
-def 파일생성(container, tree, fileMap, run_code, base_path="/opt", path=None):
-    if path is None:
-        path = []
-
-    result = None  # 최종 실행 파일 경로 저장
-
-    if tree["type"] == "folder":
-        folder_name = fileMap[tree["id"]]["name"]
-        print("-- \n경로:", "/".join(path))
-        path.append(folder_name)
-        full_path = base_path + "/" + "/".join(path)
-
-        print(f"+ 폴더생성 {folder_name}")
-        container.exec_run(cmd=["mkdir", "-p", full_path])
-
-        for node in tree.get("children", []):
-            sub_result = 파일생성(container, node, fileMap, run_code, base_path, path)
-            if sub_result:
-                result = sub_result  # 하위 트리에서 실행파일 발견 시 저장
-
-        path.pop()
-
-    elif tree["type"] == "file":
-        file_name = fileMap[tree["id"]]["name"]
-        content = fileMap[tree["id"]].get("content", "")
-        print("-- \n경로:", "/".join(path))
-        print(f"+ 파일생성 {file_name} (내용: {content}) (id: {tree['id']})")
-
-        full_path = base_path + "/" + "/".join(path + [file_name])
-
-        if run_code == tree["id"]:
-            print("=====실행파일====")
-            print(full_path)
-            print("=================")
-            result = full_path  # 실행파일 경로 저장
-
-        safe_content = content.replace("'", "'\"'\"'")
-        container.exec_run(cmd=["bash", "-c", f"echo '{safe_content}' > '{full_path}'"])
-
-    return result  # 실행 파일 경로 반환
-
-
-
-
 @app.post("/run")
 def run_code(req: CodeRequest):
     tree = req.tree
     fileMap = req.fileMap
     run_code = req.run_code
-    # print(f"run_code: {run_code}")
-    # print(f"fileMap: {fileMap}")
-    # print(f"tree: {tree}")
-
 
     global pty_socket
     if pty_socket is None:
@@ -127,8 +79,9 @@ def run_code(req: CodeRequest):
     except docker.errors.NotFound:
         return JSONResponse(status_code=404, content={"error": "Container not found"})
     
-    # 기존의 것 들 종료
+    # 기존의 것들 종료, 폴더 초기화
     container.exec_run("pkill -f /tmp/user_code.py")
+    container.exec_run("rm -rf workspace/root")
 
     # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
     # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
@@ -139,7 +92,7 @@ def run_code(req: CodeRequest):
 
         # 워크페이스 초기화
         container.exec_run("rm -rf /opt/workspace && mkdir -p /opt/workspace")
-        path = 파일생성(container, tree, fileMap,run_code, base_path="/opt/workspace")
+        path = createFile(container, tree, fileMap,run_code, base_path="/opt/workspace")
         print(f"path: {path}")
 
         # 1. 코드 저장 따로 수행
@@ -261,3 +214,47 @@ async def websocket_terminal(websocket: WebSocket):
         pty_socket = None
         if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
             await websocket.close()
+
+
+
+
+def createFile(container, tree, fileMap, run_code, base_path="/opt", path=None):
+    if path is None:
+        path = []
+
+    result = None  # 최종 실행 파일 경로 저장
+
+    if tree["type"] == "folder":
+        folder_name = fileMap[tree["id"]]["name"]
+        print("-- \n경로:", "/".join(path))
+        path.append(folder_name)
+        full_path = base_path + "/" + "/".join(path)
+
+        print(f"+ 폴더생성 {folder_name}")
+        container.exec_run(cmd=["mkdir", "-p", full_path])
+
+        for node in tree.get("children", []):
+            sub_result = createFile(container, node, fileMap, run_code, base_path, path)
+            if sub_result:
+                result = sub_result  # 하위 트리에서 실행파일 발견 시 저장
+
+        path.pop()
+
+    elif tree["type"] == "file":
+        file_name = fileMap[tree["id"]]["name"]
+        content = fileMap[tree["id"]].get("content", "")
+        print("-- \n경로:", "/".join(path))
+        print(f"+ 파일생성 {file_name} (내용: {content}) (id: {tree['id']})")
+
+        full_path = base_path + "/" + "/".join(path + [file_name])
+
+        if run_code == tree["id"]:
+            print("=====실행파일====")
+            print(full_path)
+            print("=================")
+            result = full_path  # 실행파일 경로 저장
+
+        safe_content = content.replace("'", "'\"'\"'")
+        container.exec_run(cmd=["bash", "-c", f"echo '{safe_content}' > '{full_path}'"])
+
+    return result  # 실행 파일 경로 반환
