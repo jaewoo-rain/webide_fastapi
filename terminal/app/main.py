@@ -9,7 +9,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
-import socket
 from uuid import uuid4
 
 app = FastAPI()
@@ -28,16 +27,16 @@ client = docker.from_env()
 CONTAINER_NAME = "vnc-webide"
 venv_path = "/tmp/user_venv" # 나중에 동적으로 이름 바꿔야하나?
 
-sessions = {} # sid -> PTY socket
-
 # PTY 소켓 저장용
-pty_socket = None
+sessions = {} # sid -> PTY socket
+workspaces = {}
 
 class CodeRequest(BaseModel):
     code: str
     tree: object
     fileMap: object
     run_code: str
+    session_id: str
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -46,8 +45,6 @@ app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets
 @app.get("/", include_in_schema=False)
 def serve_index():
     return FileResponse("static/index.html")
-
-
 
 @app.get("/frontend")
 def read_index():
@@ -61,17 +58,17 @@ def get_sendable_socket(sock):
         return sock._sock
     else:
         raise RuntimeError("send 가능한 소켓이 없습니다.")
-
-path = [] # 전역변수 말고 지역변수로 바꿔야함 아니면 안에 내용을 지우는 코드를 넣던지
     
 @app.post("/run")
 def run_code(req: CodeRequest):
     tree = req.tree
     fileMap = req.fileMap
     run_code = req.run_code
+    session_id = req.session_id
 
-    global pty_socket
-    if pty_socket is None:
+    pty = sessions.get(session_id)
+
+    if not pty:
         raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
 
     try: # 주어진 이름의 도커 컨테이너 가져오기
@@ -79,27 +76,22 @@ def run_code(req: CodeRequest):
     except docker.errors.NotFound:
         return JSONResponse(status_code=404, content={"error": "Container not found"})
     
-    # 기존의 것들 종료, 폴더 초기화
-    container.exec_run("pkill -f /tmp/user_code.py")
-    container.exec_run("rm -rf workspace/root")
-
-    # 안전하게 코드 파일로 만들 필요 없이, PTY에 바로 echo+실행 커맨드를 보냅니다.
-    # 마지막에 '\n'이 있어야 bash가 실행 커맨드를 읽습니다.
-    safe_code = req.code.replace("'", "'\"'\"'")
     
-
     try:
+        # 세션별 워크스페이스 초기화(자기 것만)
+        workspace = f"/opt/workspace/{req.session_id}"
+        container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
 
-        # 워크페이스 초기화
-        container.exec_run("rm -rf /opt/workspace && mkdir -p /opt/workspace")
-        path = createFile(container, tree, fileMap,run_code, base_path="/opt/workspace")
-        print(f"path: {path}")
+        # 파일 생성
+        exec_path = createFile(container, req.tree, req.fileMap, req.run_code, base_path=workspace)
+        if not exec_path:
+            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
 
-        # 1. 코드 저장 따로 수행
-        container.exec_run(cmd=["bash", "-c", f"echo '{safe_code}' > /tmp/user_code.py"])
-        # 2. 실행 명령만 WebSocket으로 전달 (CLI에 노출될 건 이 부분만)
-        # pty_socket.send(b"python3 /tmp/user_code.py\n")
-        pty_socket.send(f"python3 {path}\n".encode())
+        # 이전 실행 종료(세션 범위로 제한)
+        container.exec_run(["bash", "-lc", f"pkill -f '{workspace}' || true"])
+
+        # venv 파이썬으로 실행 (명시적으로)
+        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
 
 
         # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
@@ -126,8 +118,15 @@ def run_code(req: CodeRequest):
 
 @app.websocket("/ws")
 async def websocket_terminal(websocket: WebSocket):
-    global pty_socket
     await websocket.accept()  # 수락
+    
+    client_sid = websocket.query_params.get("sid")
+    if client_sid and client_sid in sessions:
+        await websocket.close(code=4409, reason="sid already in use")
+        return
+    sid = client_sid or str(uuid4())
+
+    await websocket.send_json({"sid": sid})  # 클라이언트에게 알려줌
 
     try:
         container = client.containers.get(CONTAINER_NAME)
@@ -136,16 +135,21 @@ async def websocket_terminal(websocket: WebSocket):
         await websocket.close()
         return
 
-    # # 가상환경 없으면 생성
-    # check = container.exec_run(f"test -f {venv_path}/bin/activate && echo OK || echo NO")
-    # if b"NO" in check.output:
-    #     result = container.exec_run(f"python3 -m venv {venv_path}")
-    #     print("venv 생성 로그:", result.output.decode())
+    # venv 보장
+    ensure_venv = f"""
+    set -e
+    if [ ! -x '{venv_path}/bin/python' ]; then
+    python3 -m venv '{venv_path}'
+    '{venv_path}/bin/python' -m pip install --upgrade pip
+    fi
+    """
+    container.exec_run(["bash","-lc", ensure_venv])
 
+    # 세션 전용 워크스페이스 생성 & 등록
+    workspace = f"/opt/workspace/{sid}"
+    container.exec_run(["bash","-lc", f"mkdir -p '{workspace}'"])
+    workspaces[sid] = workspace
 
-    # tty와 stdin을 통해 터미널 입출력 가능
-    # /bin/bash 셸을 새로운 프로세스로 실행하고, 그 실행 ID를 얻는 명령
-    # client.api.exec_create(...) = 컨테이너 안에서 새로운 프로세스를 실행할 준비
     exec_id = client.api.exec_create( # 실제 실행을 하지는 않고, 실행 준비만 하고 exec ID를 생성해줌
         container.id,
         # cmd="/bin/bash", # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
@@ -162,7 +166,8 @@ async def websocket_terminal(websocket: WebSocket):
     )
 
     # 현재 소켓 저장 -> run 함수 실행을 위해 전역으로 다룸
-    pty_socket = get_sendable_socket(sock)
+    pty = get_sendable_socket(sock)
+    sessions[sid] = pty # pty 등록하기
 
     # 현재 비동기 루프(이벤트 루프)를 가져옴. 여기에 blocking 작업을 offload할 때 사용.
     loop = asyncio.get_event_loop()
@@ -197,9 +202,8 @@ async def websocket_terminal(websocket: WebSocket):
         except RuntimeError as e:
             print(f"[write] RuntimeError: {e}")
 
-
     try:
-        await asyncio.gather(  # 읽기, 쓰기 병행 실행행
+        await asyncio.gather(  # 읽기, 쓰기 병행 실행
             read_from_container(),
             write_to_container()
         )
@@ -209,12 +213,14 @@ async def websocket_terminal(websocket: WebSocket):
     finally:
         try:
             sock.close()
+            container.exec_run(["bash","-lc", f"pkill -f '{workspace}' || true"])
+            container.exec_run(["bash","-lc", f"rm -rf '{workspace}'"])
         except Exception as e:
             print(f"소켓 종료 실패: {e}")
-        pty_socket = None
+        sessions.pop(sid, None) 
+
         if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
             await websocket.close()
-
 
 
 
