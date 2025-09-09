@@ -79,7 +79,7 @@ def run_code(req: CodeRequest):
     
     try:
         # 세션별 워크스페이스 초기화(자기 것만)
-        workspace = f"/opt/workspace/{req.session_id}"
+        workspace = f"/opt/workspace/public"
         container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
 
         # 파일 생성
@@ -152,11 +152,25 @@ async def websocket_terminal(websocket: WebSocket):
 
     exec_id = client.api.exec_create( # 실제 실행을 하지는 않고, 실행 준비만 하고 exec ID를 생성해줌
         container.id,
-        # cmd="/bin/bash", # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
-        cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"],
-        tty=True, 
-        stdin=True  # 표준 입력을 받을 수 있게 하겠다
+        cmd=[ # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
+            "bash", "-lc",
+            f"""
+            source {venv_path}/bin/activate >/dev/null 2>&1 || true;
+            export PS1='webide:\\w$ ';
+            exec bash --noprofile --norc -i
+            """
+        ],
+        tty=True, # 표준 입력을 받을 수 있게 하겠다
+        stdin=True,
     )["Id"] # exec 세션의 고유 ID
+
+    # exec_id = client.api.exec_create(
+    #     container.id,
+    #     cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"],
+    #     tty=True, 
+    #     stdin=True,  
+    #     user="1000:1000"
+    # )["Id"] 
 
     # exec_id을 이용해서 실행, sock은 바이너리 데이터 입출력을 위한 소켓 객체
     sock = client.api.exec_start(
@@ -196,12 +210,12 @@ async def websocket_terminal(websocket: WebSocket):
                 msg = await websocket.receive_text()
                 await loop.run_in_executor(None, sock.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달달
                 # await loop.run_in_executor(None, sock._sock.send, msg.encode())
-
         except WebSocketDisconnect:
             print("🔌 클라이언트 WebSocket 연결 종료")
         except RuntimeError as e:
             print(f"[write] RuntimeError: {e}")
-
+    
+    ## 시작
     try:
         await asyncio.gather(  # 읽기, 쓰기 병행 실행
             read_from_container(),
