@@ -1,44 +1,38 @@
-import os
-import socket
-import time
-import docker
-import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+import os, socket, time, uuid, asyncio
+from typing import AsyncGenerator, Dict, Tuple, List, Optional
+from datetime import datetime
+from urllib.parse import urlsplit
+import docker, httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Request, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from starlette.websockets import WebSocketState
-from uuid import uuid4
+from pydantic import BaseModel
 
-app = FastAPI()
+from config import FREE_MAX_CONTAINERS, DOCKER_DEFAULT_IMAGE, DOCKER_NETWORK, SPRING_BOOT_API_URL
+from docker_client import get_docker
+from roles import is_unlimited, ROLE_FREE
+from security import get_current_user, AuthUser, _extract_bearer_token
 
-# CORS 설정
+# ---------- FastAPI ----------
+app = FastAPI(title="WEB IDE API")
+
+# ✅ Origin 허용을 구체적으로 지정 (403 방지)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Docker 클라이언트 & 컨테이너 이름
-client = docker.from_env()
-CONTAINER_NAME = "vnc-webide"
-venv_path = "/tmp/user_venv" # 나중에 동적으로 이름 바꿔야하나?
-
-# PTY 소켓 저장용
-sessions = {} # sid -> PTY socket
-workspaces = {}
-
-class CodeRequest(BaseModel):
-    code: str
-    tree: object
-    fileMap: object
-    run_code: str
-    session_id: str
-
-# 정적 파일 서빙
+# 정적
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
 
@@ -50,231 +44,381 @@ def serve_index():
 def read_index():
     return FileResponse("frontend/dist/index.html")
 
-# 안전한 socket 추출 함수
-def get_sendable_socket(sock):
+# ---------- 공통 설정 ----------
+docker_client = get_docker()
+VNC_IMAGE = os.getenv("VNC_IMAGE", "webide-vnc")
+CONTAINER_ENV_DEFAULT = {
+    "VNC_PORT": "5901",
+    "NOVNC_PORT": "6081",
+    "VNC_GEOMETRY": "1024x768",
+    "VNC_DEPTH": "24",
+}
+INTERNAL_NOVNC_PORT = 6081
+venv_path = "/tmp/user_venv"
+
+sessions: Dict[Tuple[str, str], socket.socket] = {}
+workspaces: Dict[Tuple[str, str], str] = {}
+
+# ---------- 모델 ----------
+class CreateContainerRequest(BaseModel):
+    projectName: str
+    image: Optional[str] = None
+    cmd: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
+
+class CreateContainerResponse(BaseModel):
+    id: str
+    name: str
+    image: str
+    owner: str
+    role: str
+    limited_by_quota: bool
+    projectName: str
+    vnc_url: str
+    ws_url: str
+
+class CodeRequest(BaseModel):
+    code: str
+    tree: dict
+    fileMap: dict
+    run_code: str
+    session_id: str
+    container_id: str
+
+# ---------- 유틸 ----------
+def _find_free_port() -> int:
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+async def get_api_client(request: Request) -> AsyncGenerator[httpx.AsyncClient, None]:
+    token = _extract_bearer_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(base_url=SPRING_BOOT_API_URL, headers=headers, timeout=10.0) as client:
+        yield client
+
+def _get_sendable_socket(sock):
     if hasattr(sock, "send") and hasattr(sock, "recv"):
         return sock
-    elif hasattr(sock, "_sock") and hasattr(sock._sock, "send"):
+    if hasattr(sock, "_sock") and hasattr(sock._sock, "send"):
         return sock._sock
-    else:
-        raise RuntimeError("send 가능한 소켓이 없습니다.")
-    
-@app.post("/run")
-def run_code(req: CodeRequest):
-    tree = req.tree
-    fileMap = req.fileMap
-    run_code = req.run_code
-    session_id = req.session_id
+    raise RuntimeError("send 가능한 소켓이 없습니다.")
 
-    pty = sessions.get(session_id)
+# ---------- 권한 ----------
+def require_roles(*allowed: str):
+    async def checker(user: AuthUser = Depends(get_current_user)):
+        if user.role not in allowed:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        return user
+    return checker
 
-    if not pty:
-        raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
+@app.get("/me")
+async def me(user: AuthUser = Depends(get_current_user)):
+    return {"username": user.username, "role": user.role}
 
-    try: # 주어진 이름의 도커 컨테이너 가져오기
-        container = client.containers.get(CONTAINER_NAME)
-    except docker.errors.NotFound:
-        return JSONResponse(status_code=404, content={"error": "Container not found"})
-    
-    
+@app.get("/admin/diagnostics")
+async def admin_only(_: AuthUser = Depends(require_roles("ROLE_ADMIN"))):
+    return {"ok": True}
+
+# ---------- 컨테이너 생성 ----------
+@app.post("/containers", response_model=CreateContainerResponse, status_code=201)
+async def create_container(
+    body: CreateContainerRequest,
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    api_client: httpx.AsyncClient = Depends(get_api_client),
+):
+    # 1) (무료 계정) 생성 한도 체크 - Spring Boot
+    if not is_unlimited(user.role):
+        try:
+            # SPRING_BOOT_API_URL이 .../internal/api/ 로 끝나므로 앞에 슬래시 없이 붙입니다.
+            resp = await api_client.get(f"containers/count/{user.username}")
+            resp.raise_for_status()
+            count = resp.json().get("count", 0)
+            if count >= FREE_MAX_CONTAINERS:
+                raise HTTPException(status_code=429, detail="최대 생성 개수를 초과했습니다.")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"데이터 서버 연결 실패: {e}")
+
+    # 2) noVNC 외부 노출용 포트 할당
+    host_novnc_port = _find_free_port()
+
+    # 3) Docker 컨테이너 실행
+    image = body.image or VNC_IMAGE
+    env = dict(CONTAINER_ENV_DEFAULT)
+    if body.env:
+        env.update(body.env)
+
+    # 고유 컨테이너 이름
+    while True:
+        suffix = uuid.uuid4().hex[:8]
+        name = f"{user.username}-{suffix}"
+        try:
+            docker_client.containers.get(name)
+        except docker.errors.NotFound:
+            break
+
+    run_kwargs = {
+        "name": name,
+        "image": image,
+        "detach": True,
+        "environment": env,
+        # 컨테이너 내부 6081 → 호스트의 가용 포트에 바인딩
+        "ports": {f"{INTERNAL_NOVNC_PORT}/tcp": host_novnc_port},
+    }
+    if body.cmd:
+        run_kwargs["command"] = body.cmd
+    if DOCKER_NETWORK:
+        run_kwargs["network"] = DOCKER_NETWORK
+
     try:
-        # 세션별 워크스페이스 초기화(자기 것만)
-        workspace = f"/opt/workspace/public"
-        container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
-
-        # 파일 생성
-        exec_path = createFile(container, req.tree, req.fileMap, req.run_code, base_path=workspace)
-        if not exec_path:
-            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
-
-        # 이전 실행 종료(세션 범위로 제한)
-        container.exec_run(["bash", "-lc", f"pkill -f '{workspace}' || true"])
-
-        # venv 파이썬으로 실행 (명시적으로)
-        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
-
-
-        # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
-        for _ in range(5):
-            check = container.exec_run( 
-                cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' && echo yes || echo no"]
-            )
-            # 루트 트리에 GUI 창이 존재하는지 체크
-            if b"yes" in check.output:
-                return {
-                    "mode": "gui",
-                    "url": "http://localhost:6081/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
-                }
-            time.sleep(0.2)
-
-        # CLI 모드 결과 
-        # result = container.exec_run(cmd=["bash", "-c", "cat /tmp/out.log"])
-        return {
-            "mode": "cli",
-            # "output": result.output.decode(errors="ignore")
-        }
+        container = docker_client.containers.run(**run_kwargs)
+        container.reload()
     except Exception as e:
-        raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"Docker 컨테이너 생성 실패: {e}")
 
-@app.websocket("/ws")
-async def websocket_terminal(websocket: WebSocket):
-    await websocket.accept()  # 수락
-    
-    client_sid = websocket.query_params.get("sid")
-    if client_sid and client_sid in sessions:
-        await websocket.close(code=4409, reason="sid already in use")
-        return
-    sid = client_sid or str(uuid4())
+    # 4) 컨테이너 메타 Spring에 등록
+    try:
+        payload = {
+            "containerId": container.id,
+            "containerName": getattr(container, "name", ""),
+            "ownerUsername": user.username,
+            "imageName": image,
+            "status": container.status,
+            "projectName": body.projectName,
+        }
+        # 앞에 슬래시 없이: base_url + "containers" = .../internal/api/containers
+        resp = await api_client.post("containers", json=payload)
+        resp.raise_for_status()
+    except httpx.RequestError:
+        container.remove(force=True)
+        raise HTTPException(status_code=500, detail="컨테이너 정보 등록 실패")
 
-    await websocket.send_json({"sid": sid})  # 클라이언트에게 알려줌
+    # 5) 외부에서 접속할 URL 구성 (포트 포함, 프록시 고려)
+    #   - Host(포트 포함) 우선
+    #   - 프록시라면 X-Forwarded-* 를 신뢰
+    #   - 마지막으로 request.url 의 host:port 사용
+    xf_host = request.headers.get("x-forwarded-host")
+    host_hdr = request.headers.get("host")
+    if xf_host:
+        netloc = xf_host                  # 예: "example.com" 또는 "example.com:8443"
+    elif host_hdr:
+        netloc = host_hdr                 # 예: "localhost:8000"
+    else:
+        # 최후의 보루: 클라이언트 주소 + FastAPI가 떠있는 포트
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        netloc = f"{request.client.host}:{port}"
+
+    # 스킴 결정 (http/https → ws/wss)
+    xf_proto = request.headers.get("x-forwarded-proto")
+    http_scheme = xf_proto or request.url.scheme  # "http" or "https"
+    ws_scheme = "wss" if http_scheme == "https" else "ws"
+
+    # vnc_url용 hostname (netloc에 포트가 들어있을 수 있으므로 호스트만 분리)
+    host_only = urlsplit(f"//{netloc}", scheme="http").hostname or request.client.host
+
+    # 최종 URL
+    sid = uuid.uuid4().hex
+    ws_url = f"{ws_scheme}://{netloc}/ws?cid={container.id}&sid={sid}"
+    vnc_url = (
+        f"{http_scheme}://{host_only}:{host_novnc_port}"
+        "/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
+    )
+
+    # 6) 응답
+    return CreateContainerResponse(
+        id=container.id[:12],
+        name=getattr(container, "name", ""),
+        image=image,
+        owner=user.username,
+        role=user.role,
+        limited_by_quota=(user.role == ROLE_FREE),
+        projectName=body.projectName,
+        vnc_url=vnc_url,
+        ws_url=ws_url,
+    )
+
+
+# ---------- 내 컨테이너 목록 ----------
+@app.get("/containers/my")
+async def list_my_containers(
+    user: AuthUser = Depends(get_current_user),
+    api_client: httpx.AsyncClient = Depends(get_api_client)
+):
+    try:
+        resp = await api_client.get(f"containers")
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.RequestError as e:
+        raise HTTPException(503, detail=f"데이터 서버에서 목록 조회 실패: {e}")
+
+# ---------- 컨테이너 삭제 ----------
+@app.delete("/containers/{container_id}", status_code=204)
+async def delete_container(
+    container_id: str,
+    user: AuthUser = Depends(get_current_user),
+    api_client: httpx.AsyncClient = Depends(get_api_client)
+):
+    try:
+        c = docker_client.containers.get(container_id)
+        c.remove(force=True)
+    except docker.errors.NotFound:
+        pass
 
     try:
-        container = client.containers.get(CONTAINER_NAME)
+        resp = await api_client.delete(f"containers/{container_id}/owner/{user.username}")
+        resp.raise_for_status()
+    except httpx.RequestError:
+        raise HTTPException(500, detail="DB에서 컨테이너 정보 삭제 실패")
+
+# ---------- WebSocket PTY ----------
+@app.websocket("/ws")
+async def websocket_terminal(websocket: WebSocket,
+                             cid: str = Query(..., alias="cid"),
+                             client_sid: Optional[str] = Query(None, alias="sid")):
+    await websocket.accept()
+    try:
+        container = docker_client.containers.get(cid)
     except docker.errors.NotFound:
-        await websocket.send_text(" 컨테이너가 없습니다.")
+        await websocket.send_text("컨테이너가 없습니다.")
         await websocket.close()
         return
 
-    # venv 보장
+    if not client_sid:
+        client_sid = uuid.uuid4().hex
+    key = (cid, client_sid)
+    if key in sessions:
+        await websocket.close(code=4409, reason="sid already in use")
+        return
+
+    await websocket.send_json({"sid": client_sid})
+
     ensure_venv = f"""
     set -e
     if [ ! -x '{venv_path}/bin/python' ]; then
-    python3 -m venv '{venv_path}'
-    '{venv_path}/bin/python' -m pip install --upgrade pip
+        python3 -m venv '{venv_path}'
+        '{venv_path}/bin/python' -m pip install --upgrade pip
     fi
     """
     container.exec_run(["bash","-lc", ensure_venv])
 
-    # 세션 전용 워크스페이스 생성 & 등록
-    workspace = f"/opt/workspace/{sid}"
+    workspace = f"/opt/workspace/{client_sid}"
     container.exec_run(["bash","-lc", f"mkdir -p '{workspace}'"])
-    workspaces[sid] = workspace
+    workspaces[key] = workspace
 
-    exec_id = client.api.exec_create( # 실제 실행을 하지는 않고, 실행 준비만 하고 exec ID를 생성해줌
+    exec_id = docker_client.api.exec_create(
         container.id,
-        cmd=[ # 컨테이너 안에서 실행할 명령어 : bash 셸을 실행하겠다 -> 컨테이너 안에 새로운 bash 터미널을 띄워서 상호작용할 수 있게 준비
+        cmd=[
             "bash", "-lc",
-            f"""
-            source {venv_path}/bin/activate >/dev/null 2>&1 || true;
-            export PS1='webide:\\w$ ';
-            exec bash --noprofile --norc -i
-            """
+            f"source {venv_path}/bin/activate >/dev/null 2>&1 || true; "
+            f"export PS1='webide:\\w$ '; exec bash --noprofile --norc -i"
         ],
-        tty=True, # 표준 입력을 받을 수 있게 하겠다
-        stdin=True,
-    )["Id"] # exec 세션의 고유 ID
-
-    # exec_id = client.api.exec_create(
-    #     container.id,
-    #     cmd=["bash", "-c", f"source {venv_path}/bin/activate && exec bash"],
-    #     tty=True, 
-    #     stdin=True,  
-    #     user="1000:1000"
-    # )["Id"] 
-
-    # exec_id을 이용해서 실행, sock은 바이너리 데이터 입출력을 위한 소켓 객체
-    sock = client.api.exec_start(
-        exec_id,
         tty=True,
-        socket=True
-    )
+        stdin=True,
+    )["Id"]
 
-    # 현재 소켓 저장 -> run 함수 실행을 위해 전역으로 다룸
-    pty = get_sendable_socket(sock)
-    sessions[sid] = pty # pty 등록하기
+    sock = docker_client.api.exec_start(exec_id, tty=True, socket=True)
+    pty = _get_sendable_socket(sock)
+    sessions[key] = pty
 
-    # 현재 비동기 루프(이벤트 루프)를 가져옴. 여기에 blocking 작업을 offload할 때 사용.
     loop = asyncio.get_event_loop()
 
-    # 데이터를 클라이언트에게 보내기기
-    async def read_from_container():
+    async def reader():
         try:
             while True:
-                try:
-                    data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
-                    if not data:
-                        break
-                    await websocket.send_text(data.decode(errors="ignore"))
-                except socket.timeout: # 타임아웃 되더라도 계속 실행함
-                    print("[read] recv timed out, but continuing...")
-                    continue
-        except Exception as e:
-            print(f"[read] 예외: {e}")
+                data = await loop.run_in_executor(None, sock.recv, 1024)
+                if not data: break
+                await websocket.send_text(data.decode(errors="ignore"))
+        except Exception:
+            pass
 
-
-
-    # 데이터를 컨테이너에게 보내기
-    async def write_to_container():
+    async def writer():
         try:
             while True:
                 msg = await websocket.receive_text()
-                await loop.run_in_executor(None, sock.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달달
-                # await loop.run_in_executor(None, sock._sock.send, msg.encode())
+                await loop.run_in_executor(None, sock.send, msg.encode())
         except WebSocketDisconnect:
-            print("🔌 클라이언트 WebSocket 연결 종료")
-        except RuntimeError as e:
-            print(f"[write] RuntimeError: {e}")
-    
-    ## 시작
+            pass
+        except RuntimeError:
+            pass
+
     try:
-        await asyncio.gather(  # 읽기, 쓰기 병행 실행
-            read_from_container(),
-            write_to_container()
-        )
-    except Exception as e:
-        print(f"[main] gather 예외 발생: {e}")
-        # await websocket.close()
+        await asyncio.gather(reader(), writer())
     finally:
         try:
             sock.close()
             container.exec_run(["bash","-lc", f"pkill -f '{workspace}' || true"])
             container.exec_run(["bash","-lc", f"rm -rf '{workspace}'"])
-        except Exception as e:
-            print(f"소켓 종료 실패: {e}")
-        sessions.pop(sid, None) 
-
-        if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
+        except Exception:
+            pass
+        sessions.pop(key, None)
+        workspaces.pop(key, None)
+        if websocket.application_state != WebSocketState.DISCONNECTED:
             await websocket.close()
 
+# ---------- 코드 실행 ----------
+@app.post("/run")
+def run_code(req: CodeRequest):
+    cid = req.container_id
+    sid = req.session_id
+    key = (cid, sid)
 
+    pty = sessions.get(key)
+    if not pty:
+        raise HTTPException(400, "PTY 세션이 없습니다. 먼저 WS로 연결하세요.")
 
-def createFile(container, tree, fileMap, run_code, base_path="/opt", path=None):
-    if path is None:
-        path = []
+    try:
+        container = docker_client.containers.get(cid)
+    except docker.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": "Container not found"})
 
-    result = None  # 최종 실행 파일 경로 저장
+    try:
+        workspace = workspaces.get(key) or f"/opt/workspace/{sid}"
+        container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
+
+        exec_path = _create_files_in_container(container, req.tree, req.fileMap, req.run_code, base_path=workspace)
+        if not exec_path:
+            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
+
+        container.exec_run(["bash", "-lc", f"pkill -f '{workspace}' || true"])
+        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
+
+        for _ in range(5):
+            check = container.exec_run(
+                cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' >/dev/null && echo yes || echo no"]
+            )
+            if b"yes" in check.output:
+                return {"mode": "gui"}
+            time.sleep(0.2)
+
+        return {"mode": "cli"}
+    except Exception as e:
+        raise HTTPException(500, f"실행 실패: {e}")
+
+# ---------- 파일 생성 ----------
+def _create_files_in_container(container, tree, fileMap, run_code, base_path="/opt", path=None):
+    if path is None: path = []
+    result = None
 
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
-        print("-- \n경로:", "/".join(path))
         path.append(folder_name)
         full_path = base_path + "/" + "/".join(path)
-
-        print(f"+ 폴더생성 {folder_name}")
         container.exec_run(cmd=["mkdir", "-p", full_path])
-
         for node in tree.get("children", []):
-            sub_result = createFile(container, node, fileMap, run_code, base_path, path)
-            if sub_result:
-                result = sub_result  # 하위 트리에서 실행파일 발견 시 저장
-
+            sub = _create_files_in_container(container, node, fileMap, run_code, base_path, path)
+            if sub: result = sub
         path.pop()
 
     elif tree["type"] == "file":
         file_name = fileMap[tree["id"]]["name"]
         content = fileMap[tree["id"]].get("content", "")
-        print("-- \n경로:", "/".join(path))
-        print(f"+ 파일생성 {file_name} (내용: {content}) (id: {tree['id']})")
-
         full_path = base_path + "/" + "/".join(path + [file_name])
-
         if run_code == tree["id"]:
-            print("=====실행파일====")
-            print(full_path)
-            print("=================")
-            result = full_path  # 실행파일 경로 저장
+            result = full_path
+        safe = content.replace("'", "'\"'\"'")
+        container.exec_run(cmd=["bash", "-c", f"echo '{safe}' > '{full_path}'"])
 
-        safe_content = content.replace("'", "'\"'\"'")
-        container.exec_run(cmd=["bash", "-c", f"echo '{safe_content}' > '{full_path}'"])
-
-    return result  # 실행 파일 경로 반환
+    return result
