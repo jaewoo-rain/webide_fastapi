@@ -1,7 +1,9 @@
+# app/main.py
 import os, socket, time, uuid, asyncio
 from typing import AsyncGenerator, Dict, Tuple, List, Optional
 from datetime import datetime
 from urllib.parse import urlsplit
+
 import docker, httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,31 +20,17 @@ from security import get_current_user, AuthUser, _extract_bearer_token
 # ---------- FastAPI ----------
 app = FastAPI(title="WEB IDE API")
 
-# ✅ Origin 허용을 구체적으로 지정 (403 방지)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 정적
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
-app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
-
-@app.get("/", include_in_schema=False)
-def serve_index():
-    return FileResponse("static/index.html")
-
-@app.get("/frontend")
-def read_index():
-    return FileResponse("frontend/dist/index.html")
+# 정적(선택)
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
 # ---------- 공통 설정 ----------
 docker_client = get_docker()
@@ -56,6 +44,7 @@ CONTAINER_ENV_DEFAULT = {
 INTERNAL_NOVNC_PORT = 6081
 venv_path = "/tmp/user_venv"
 
+# (cid, sid) -> PTY
 sessions: Dict[Tuple[str, str], socket.socket] = {}
 workspaces: Dict[Tuple[str, str], str] = {}
 
@@ -85,6 +74,11 @@ class CodeRequest(BaseModel):
     session_id: str
     container_id: str
 
+class ContainerUrlsResponse(BaseModel):
+    cid: str
+    ws_url: str
+    vnc_url: str
+
 # ---------- 유틸 ----------
 def _find_free_port() -> int:
     s = socket.socket()
@@ -95,7 +89,7 @@ def _find_free_port() -> int:
 
 async def get_api_client(request: Request) -> AsyncGenerator[httpx.AsyncClient, None]:
     token = _extract_bearer_token(request)
-    headers = {"Authorization": f"Bearer {token}"}
+    headers={"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(base_url=SPRING_BOOT_API_URL, headers=headers, timeout=10.0) as client:
         yield client
 
@@ -105,6 +99,35 @@ def _get_sendable_socket(sock):
     if hasattr(sock, "_sock") and hasattr(sock._sock, "send"):
         return sock._sock
     raise RuntimeError("send 가능한 소켓이 없습니다.")
+
+def _build_netloc_and_schemes(request: Request) -> tuple[str, str, str, str]:
+    """return netloc, http_scheme, ws_scheme, host_only"""
+    xf_host = request.headers.get("x-forwarded-host")
+    host_hdr = request.headers.get("host")
+    if xf_host:
+        netloc = xf_host
+    elif host_hdr:
+        netloc = host_hdr
+    else:
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        netloc = f"{request.client.host}:{port}"
+
+    xf_proto = request.headers.get("x-forwarded-proto")
+    http_scheme = xf_proto or request.url.scheme  # "http" or "https"
+    ws_scheme = "wss" if http_scheme == "https" else "ws"
+    host_only = urlsplit(f"//{netloc}", scheme="http").hostname or request.client.host
+    return netloc, http_scheme, ws_scheme, host_only
+
+def _resolve_container_id(container_id: str) -> str:
+    """짧은 ID도 풀ID로 정규화"""
+    try:
+        c = docker_client.containers.get(container_id)
+        return c.id
+    except docker.errors.NotFound:
+        for c in docker_client.containers.list(all=True):
+            if c.id.startswith(container_id):
+                return c.id
+        raise
 
 # ---------- 권한 ----------
 def require_roles(*allowed: str):
@@ -118,40 +141,33 @@ def require_roles(*allowed: str):
 async def me(user: AuthUser = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
 
-@app.get("/admin/diagnostics")
-async def admin_only(_: AuthUser = Depends(require_roles("ROLE_ADMIN"))):
-    return {"ok": True}
-
 # ---------- 컨테이너 생성 ----------
 @app.post("/containers", response_model=CreateContainerResponse, status_code=201)
 async def create_container(
     body: CreateContainerRequest,
     request: Request,
     user: AuthUser = Depends(get_current_user),
-    api_client: httpx.AsyncClient = Depends(get_api_client),
+    api_client: httpx.AsyncClient = Depends(get_api_client)
 ):
-    # 1) (무료 계정) 생성 한도 체크 - Spring Boot
+    # 1) 할당량 확인
     if not is_unlimited(user.role):
         try:
-            # SPRING_BOOT_API_URL이 .../internal/api/ 로 끝나므로 앞에 슬래시 없이 붙입니다.
             resp = await api_client.get(f"containers/count/{user.username}")
             resp.raise_for_status()
             count = resp.json().get("count", 0)
             if count >= FREE_MAX_CONTAINERS:
                 raise HTTPException(status_code=429, detail="최대 생성 개수를 초과했습니다.")
         except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"데이터 서버 연결 실패: {e}")
+            raise HTTPException(503, detail=f"데이터 서버 연결 실패: {e}")
 
-    # 2) noVNC 외부 노출용 포트 할당
+    # 2) 포트 할당
     host_novnc_port = _find_free_port()
 
-    # 3) Docker 컨테이너 실행
+    # 3) 컨테이너 실행
     image = body.image or VNC_IMAGE
     env = dict(CONTAINER_ENV_DEFAULT)
-    if body.env:
-        env.update(body.env)
+    if body.env: env.update(body.env)
 
-    # 고유 컨테이너 이름
     while True:
         suffix = uuid.uuid4().hex[:8]
         name = f"{user.username}-{suffix}"
@@ -165,21 +181,18 @@ async def create_container(
         "image": image,
         "detach": True,
         "environment": env,
-        # 컨테이너 내부 6081 → 호스트의 가용 포트에 바인딩
         "ports": {f"{INTERNAL_NOVNC_PORT}/tcp": host_novnc_port},
     }
-    if body.cmd:
-        run_kwargs["command"] = body.cmd
-    if DOCKER_NETWORK:
-        run_kwargs["network"] = DOCKER_NETWORK
+    if body.cmd: run_kwargs["command"] = body.cmd
+    if DOCKER_NETWORK: run_kwargs["network"] = DOCKER_NETWORK
 
     try:
         container = docker_client.containers.run(**run_kwargs)
         container.reload()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Docker 컨테이너 생성 실패: {e}")
+        raise HTTPException(500, detail=f"Docker 컨테이너 생성 실패: {e}")
 
-    # 4) 컨테이너 메타 Spring에 등록
+    # 4) Spring DB 등록
     try:
         payload = {
             "containerId": container.id,
@@ -189,45 +202,18 @@ async def create_container(
             "status": container.status,
             "projectName": body.projectName,
         }
-        # 앞에 슬래시 없이: base_url + "containers" = .../internal/api/containers
         resp = await api_client.post("containers", json=payload)
         resp.raise_for_status()
     except httpx.RequestError:
         container.remove(force=True)
-        raise HTTPException(status_code=500, detail="컨테이너 정보 등록 실패")
+        raise HTTPException(500, detail="컨테이너 정보 등록 실패")
 
-    # 5) 외부에서 접속할 URL 구성 (포트 포함, 프록시 고려)
-    #   - Host(포트 포함) 우선
-    #   - 프록시라면 X-Forwarded-* 를 신뢰
-    #   - 마지막으로 request.url 의 host:port 사용
-    xf_host = request.headers.get("x-forwarded-host")
-    host_hdr = request.headers.get("host")
-    if xf_host:
-        netloc = xf_host                  # 예: "example.com" 또는 "example.com:8443"
-    elif host_hdr:
-        netloc = host_hdr                 # 예: "localhost:8000"
-    else:
-        # 최후의 보루: 클라이언트 주소 + FastAPI가 떠있는 포트
-        port = request.url.port or (443 if request.url.scheme == "https" else 80)
-        netloc = f"{request.client.host}:{port}"
-
-    # 스킴 결정 (http/https → ws/wss)
-    xf_proto = request.headers.get("x-forwarded-proto")
-    http_scheme = xf_proto or request.url.scheme  # "http" or "https"
-    ws_scheme = "wss" if http_scheme == "https" else "ws"
-
-    # vnc_url용 hostname (netloc에 포트가 들어있을 수 있으므로 호스트만 분리)
-    host_only = urlsplit(f"//{netloc}", scheme="http").hostname or request.client.host
-
-    # 최종 URL
+    # 5) URL 구성
+    netloc, http_scheme, ws_scheme, host_only = _build_netloc_and_schemes(request)
     sid = uuid.uuid4().hex
     ws_url = f"{ws_scheme}://{netloc}/ws?cid={container.id}&sid={sid}"
-    vnc_url = (
-        f"{http_scheme}://{host_only}:{host_novnc_port}"
-        "/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
-    )
+    vnc_url = f"{http_scheme}://{host_only}:{host_novnc_port}/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
 
-    # 6) 응답
     return CreateContainerResponse(
         id=container.id[:12],
         name=getattr(container, "name", ""),
@@ -240,7 +226,6 @@ async def create_container(
         ws_url=ws_url,
     )
 
-
 # ---------- 내 컨테이너 목록 ----------
 @app.get("/containers/my")
 async def list_my_containers(
@@ -248,39 +233,59 @@ async def list_my_containers(
     api_client: httpx.AsyncClient = Depends(get_api_client)
 ):
     try:
-        resp = await api_client.get(f"containers")
+        resp = await api_client.get("containers")
         resp.raise_for_status()
         return resp.json()
     except httpx.RequestError as e:
         raise HTTPException(503, detail=f"데이터 서버에서 목록 조회 실패: {e}")
 
-# ---------- 컨테이너 삭제 ----------
-@app.delete("/containers/{container_id}", status_code=204)
-async def delete_container(
+# ---------- 기존 컨테이너 재접속: ws_url / vnc_url 발급 ----------
+@app.get("/containers/{container_id}/urls", response_model=ContainerUrlsResponse)
+async def get_container_urls(
     container_id: str,
+    request: Request,
     user: AuthUser = Depends(get_current_user),
-    api_client: httpx.AsyncClient = Depends(get_api_client)
 ):
     try:
-        c = docker_client.containers.get(container_id)
-        c.remove(force=True)
+        full_id = _resolve_container_id(container_id)
+        container = docker_client.containers.get(full_id)
     except docker.errors.NotFound:
-        pass
+        raise HTTPException(status_code=404, detail="Container not found")
 
+    # novnc host 포트(6081/tcp 바인딩) 확인
     try:
-        resp = await api_client.delete(f"containers/{container_id}/owner/{user.username}")
-        resp.raise_for_status()
-    except httpx.RequestError:
-        raise HTTPException(500, detail="DB에서 컨테이너 정보 삭제 실패")
+        ports = container.attrs["NetworkSettings"]["Ports"]
+        bindings = ports.get("6081/tcp") or []
+        host_port = bindings[0]["HostPort"] if bindings else None
+    except Exception:
+        host_port = None
+
+    if not host_port:
+        raise HTTPException(status_code=409, detail="noVNC port not published for this container")
+
+    netloc, http_scheme, ws_scheme, host_only = _build_netloc_and_schemes(request)
+
+    sid = uuid.uuid4().hex
+    ws_url = f"{ws_scheme}://{netloc}/ws?cid={full_id}&sid={sid}"
+    vnc_url = (
+        f"{http_scheme}://{host_only}:{host_port}"
+        "/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
+    )
+    return ContainerUrlsResponse(cid=full_id, ws_url=ws_url, vnc_url=vnc_url)
 
 # ---------- WebSocket PTY ----------
 @app.websocket("/ws")
-async def websocket_terminal(websocket: WebSocket,
-                             cid: str = Query(..., alias="cid"),
-                             client_sid: Optional[str] = Query(None, alias="sid")):
+async def websocket_terminal(
+    websocket: WebSocket,
+    cid: str = Query(..., alias="cid"),
+    client_sid: Optional[str] = Query(None, alias="sid")
+):
     await websocket.accept()
+
+    # 풀 ID로 정규화
     try:
-        container = docker_client.containers.get(cid)
+        full_id = _resolve_container_id(cid)
+        container = docker_client.containers.get(full_id)
     except docker.errors.NotFound:
         await websocket.send_text("컨테이너가 없습니다.")
         await websocket.close()
@@ -288,7 +293,7 @@ async def websocket_terminal(websocket: WebSocket,
 
     if not client_sid:
         client_sid = uuid.uuid4().hex
-    key = (cid, client_sid)
+    key = (full_id, client_sid)
     if key in sessions:
         await websocket.close(code=4409, reason="sid already in use")
         return
@@ -361,30 +366,39 @@ async def websocket_terminal(websocket: WebSocket,
 # ---------- 코드 실행 ----------
 @app.post("/run")
 def run_code(req: CodeRequest):
-    cid = req.container_id
-    sid = req.session_id
-    key = (cid, sid)
+    # 컨테이너 ID 풀ID로 정규화
+    try:
+        container = docker_client.containers.get(req.container_id)
+    except docker.errors.NotFound:
+        try:
+            full_id = _resolve_container_id(req.container_id)
+            container = docker_client.containers.get(full_id)
+        except docker.errors.NotFound:
+            return JSONResponse(status_code=404, content={"error": "Container not found"})
+
+    full_id = container.id
+    key = (full_id, req.session_id)
 
     pty = sessions.get(key)
     if not pty:
         raise HTTPException(400, "PTY 세션이 없습니다. 먼저 WS로 연결하세요.")
 
     try:
-        container = docker_client.containers.get(cid)
-    except docker.errors.NotFound:
-        return JSONResponse(status_code=404, content={"error": "Container not found"})
-
-    try:
-        workspace = workspaces.get(key) or f"/opt/workspace/{sid}"
+        # 세션 워크스페이스 초기화
+        workspace = workspaces.get(key) or f"/opt/workspace/{req.session_id}"
         container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
 
         exec_path = _create_files_in_container(container, req.tree, req.fileMap, req.run_code, base_path=workspace)
         if not exec_path:
             raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
 
+        # 이전 실행 종료
         container.exec_run(["bash", "-lc", f"pkill -f '{workspace}' || true"])
+
+        # venv 파이썬 실행
         pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
 
+        # GUI 체크
         for _ in range(5):
             check = container.exec_run(
                 cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' >/dev/null && echo yes || echo no"]
@@ -397,9 +411,10 @@ def run_code(req: CodeRequest):
     except Exception as e:
         raise HTTPException(500, f"실행 실패: {e}")
 
-# ---------- 파일 생성 ----------
+# ---------- 파일 생성 로직 ----------
 def _create_files_in_container(container, tree, fileMap, run_code, base_path="/opt", path=None):
-    if path is None: path = []
+    if path is None:
+        path = []
     result = None
 
     if tree["type"] == "folder":
