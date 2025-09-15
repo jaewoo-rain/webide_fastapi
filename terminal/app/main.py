@@ -22,7 +22,7 @@ app = FastAPI(title="WEB IDE API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,11 +43,10 @@ CONTAINER_ENV_DEFAULT = {
 }
 INTERNAL_NOVNC_PORT = 6081
 venv_path = "/tmp/user_venv"
+FIXED_WORKSPACE = "/opt/workspace"
 
 # (cid, sid) -> PTY
 sessions: Dict[Tuple[str, str], socket.socket] = {}
-workspaces: Dict[Tuple[str, str], str] = {}
-
 # ---------- 모델 ----------
 class CreateContainerRequest(BaseModel):
     projectName: str
@@ -300,6 +299,7 @@ async def websocket_terminal(
 
     await websocket.send_json({"sid": client_sid})
 
+    # venv 보장
     ensure_venv = f"""
     set -e
     if [ ! -x '{venv_path}/bin/python' ]; then
@@ -309,10 +309,10 @@ async def websocket_terminal(
     """
     container.exec_run(["bash","-lc", ensure_venv])
 
-    workspace = f"/opt/workspace/{client_sid}"
-    container.exec_run(["bash","-lc", f"mkdir -p '{workspace}'"])
-    workspaces[key] = workspace
+    # ✅ 더는 세션 전용 폴더를 만들지 않음
+    # workspace = f"/opt/workspace/{client_sid}"  (삭제)
 
+    # bash 인터랙티브 세션
     exec_id = docker_client.api.exec_create(
         container.id,
         cmd=[
@@ -334,7 +334,8 @@ async def websocket_terminal(
         try:
             while True:
                 data = await loop.run_in_executor(None, sock.recv, 1024)
-                if not data: break
+                if not data:
+                    break
                 await websocket.send_text(data.decode(errors="ignore"))
         except Exception:
             pass
@@ -354,14 +355,16 @@ async def websocket_terminal(
     finally:
         try:
             sock.close()
-            container.exec_run(["bash","-lc", f"pkill -f '{workspace}' || true"])
-            container.exec_run(["bash","-lc", f"rm -rf '{workspace}'"])
+            # ✅ 세션 종료 시 폴더/프로세스 정리 제거 (세션 전용 워크스페이스 없으므로)
+            # container.exec_run(["bash","-lc", f"pkill -f '{workspace}' || true"])
+            # container.exec_run(["bash","-lc", f"rm -rf '{workspace}'"])
         except Exception:
             pass
         sessions.pop(key, None)
-        workspaces.pop(key, None)
+        # workspaces.pop(key, None)  # 사용 안 함
         if websocket.application_state != WebSocketState.DISCONNECTED:
             await websocket.close()
+
 
 # ---------- 코드 실행 ----------
 @app.post("/run")
@@ -384,16 +387,20 @@ def run_code(req: CodeRequest):
         raise HTTPException(400, "PTY 세션이 없습니다. 먼저 WS로 연결하세요.")
 
     try:
-        # 세션 워크스페이스 초기화
-        workspace = workspaces.get(key) or f"/opt/workspace/{req.session_id}"
-        container.exec_run(["bash", "-lc", f"mkdir -p '{workspace}' && find '{workspace}' -mindepth 1 -delete"])
+        # ✅ 세션별 폴더 대신 고정 워크스페이스 사용
+        container.exec_run([
+            "bash", "-lc",
+            f"mkdir -p '{FIXED_WORKSPACE}' && find '{FIXED_WORKSPACE}' -mindepth 1 -delete"
+        ])
 
-        exec_path = _create_files_in_container(container, req.tree, req.fileMap, req.run_code, base_path=workspace)
+        exec_path = _create_files_in_container(
+            container, req.tree, req.fileMap, req.run_code, base_path=FIXED_WORKSPACE
+        )
         if not exec_path:
             raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
 
-        # 이전 실행 종료
-        container.exec_run(["bash", "-lc", f"pkill -f '{workspace}' || true"])
+        # 이전 실행 종료(고정 워크스페이스 기준)
+        container.exec_run(["bash", "-lc", f"pkill -f '{FIXED_WORKSPACE}' || true"])
 
         # venv 파이썬 실행
         pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
@@ -410,6 +417,7 @@ def run_code(req: CodeRequest):
         return {"mode": "cli"}
     except Exception as e:
         raise HTTPException(500, f"실행 실패: {e}")
+
 
 # ---------- 파일 생성 로직 ----------
 def _create_files_in_container(container, tree, fileMap, run_code, base_path="/opt", path=None):
