@@ -43,7 +43,7 @@ CONTAINER_ENV_DEFAULT = {
 }
 INTERNAL_NOVNC_PORT = 6081
 venv_path = "/tmp/user_venv"
-FIXED_WORKSPACE = "/opt/workspace"
+WORKSPACE = "/opt/workspace"
 
 # (cid, sid) -> PTY
 sessions: Dict[Tuple[str, str], socket.socket] = {}
@@ -390,17 +390,17 @@ def run_code(req: CodeRequest):
         # ✅ 세션별 폴더 대신 고정 워크스페이스 사용
         container.exec_run([
             "bash", "-lc",
-            f"mkdir -p '{FIXED_WORKSPACE}' && find '{FIXED_WORKSPACE}' -mindepth 1 -delete"
+            f"mkdir -p '{WORKSPACE}' && find '{WORKSPACE}' -mindepth 1 -delete"
         ])
 
         exec_path = _create_files_in_container(
-            container, req.tree, req.fileMap, req.run_code, base_path=FIXED_WORKSPACE
+            container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE
         )
         if not exec_path:
             raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
 
         # 이전 실행 종료(고정 워크스페이스 기준)
-        container.exec_run(["bash", "-lc", f"pkill -f '{FIXED_WORKSPACE}' || true"])
+        container.exec_run(["bash", "-lc", f"pkill -f '{WORKSPACE}' || true"])
 
         # venv 파이썬 실행
         pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
