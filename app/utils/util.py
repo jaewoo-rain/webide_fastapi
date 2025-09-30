@@ -80,7 +80,7 @@ def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None)
 
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
-            # 👇 [추가] 폴더 이름이 비어있지 않을 때만 경로에 추가하고 폴더를 생성합니다.
+            # 폴더 이름이 비어있지 않을 때만 경로에 추가하고 폴더를 생성합니다.
         if folder_name:
             path.append(folder_name)
             full_path = base_path + "/" + "/".join(path)
@@ -103,3 +103,6 @@ def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None)
         container.exec_run(cmd=["bash", "-c", f"echo '{safe}' > '{full_path}'"])
 
     return result
+
+
+

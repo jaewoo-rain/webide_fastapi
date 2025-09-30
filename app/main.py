@@ -375,7 +375,7 @@ def get_files(container_id: str):
     except docker.errors.NotFound:
         raise HTTPException(status_code=404, detail="Container not found")
 
-    # 1. 컨테이너에서 파일 목록 가져오기 (-print0으로 안전하게 처리)
+    # 컨테이너에서 파일 및 폴더 목록 가져오기 
     exit_code, raw_output = container.exec_run(f"find {WORKSPACE} -print0")
     if exit_code != 0:
         # WORKSPACE가 없는 초기 상태일 수 있으므로 빈 구조 반환
@@ -385,28 +385,21 @@ def get_files(container_id: str):
         )
 
     paths = [p for p in raw_output.decode().split('\0') if p]
-    if not paths:
-         return FileStructureResponse(
-            tree={"id": "root", "type": "folder", "children": []},
-            fileMap={"root": {"name": "", "type": "folder"}}
-        )
 
-    # ✅ 2. [수정] 컨테이너에서 '파일' 경로만 정확하게 가져오기
+    # 컨테이너에서 파일 목록 가져오기 
     _, file_paths_blob = container.exec_run(f"find {WORKSPACE} -type f -print0")
     file_paths = file_paths_blob.decode().split('\0')
     file_paths_set = set(file_paths) # 빠른 조회를 위해 set으로 변환
 
-    # 3. 파일 내용 한 번에 읽어오기 (이제 진짜 파일만 읽음)
+    # 파일 내용 한 번에 읽어오기 
     contents = {}
-    # ✅ [수정] 비어있을 수 있는 '' 경로 제거
-    valid_file_paths = [p for p in file_paths if p]
+    valid_file_paths = [p for p in file_paths if p] # 공백 제거
 
     if valid_file_paths:
 
-        # 👇 [수정] 이 라인이 누락되었습니다!
         delimiter = "---FILE-CONTENT-DELIMITER---"
 
-        # 공백이나 특수문자가 포함된 경로를 안전하게 처리하기 위해 수정
+        # 파일 내용 출력 명령어 생성 및 실행
         paths_str = " ".join([f"'{p}'" for p in valid_file_paths])
         cmd = f"bash -c 'for f in {paths_str}; do cat \"$f\"; echo \"{delimiter}\"; done'"
         _, content_blob = container.exec_run(cmd)
@@ -420,8 +413,8 @@ def get_files(container_id: str):
             contents[path] = split_contents[i]
 
 
-    # 3. tree와 fileMap 구조로 재구성
-    file_map = {"root": {"name": "root", "type": "folder"}}
+    # tree와 fileMap 구조로 재구성
+    file_map = {"root": {"name": "", "type": "folder"}}
     nodes = {"root": {"id": "root", "type": "folder", "children": []}}
     
     # 경로를 정렬하여 부모가 항상 자식보다 먼저 오도록 함
@@ -441,7 +434,7 @@ def get_files(container_id: str):
                     parent_id = node_id
                     break
 
-        # ✅ [수정] 파일 여부를 file_paths_set에 있는지 확인하여 정확하게 판단
+        # 파일 여부를 file_paths_set에 있는지 확인하여 정확하게 판단
         is_file = path_str in file_paths_set
         node_type = "file" if is_file else "folder"
         
@@ -492,11 +485,6 @@ def run_code(req: CodeRequest):
         raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
 
     try:
-        # container.exec_run([
-        #     "bash", "-lc",
-        #     f"mkdir -p '{WORKSPACE}' && find '{WORKSPACE}' -mindepth 1 -delete"
-        # ])
-
         # WORKSPACE 폴더가 없는 경우에만 생성
         container.exec_run(["mkdir", "-p", WORKSPACE])
 
