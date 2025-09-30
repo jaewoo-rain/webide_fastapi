@@ -13,8 +13,16 @@ from security.security import get_current_user, AuthUser, _extract_bearer_token
 from urllib.parse import urlsplit
 from config import ROLE_ADMIN, ROLE_MEMBER, ROLE_FREE, FREE_MAX_CONTAINERS, DOCKER_NETWORK, VNC_IMAGE, CONTAINER_ENV_DEFAULT, INTERNAL_NOVNC_PORT, WORKSPACE, ALLOWED_NOVNC_PORTS
 from docker_client import get_docker
-from models import CodeRequest, CreateContainerRequest, CreateContainerResponse, ContainerUrlsResponse
+# --- 모델 관련 import 시작 ---
+from models.CodeRequest import CodeRequest
+from models.CreateContainerRequest import CreateContainerRequest
+from models.CreateContainerResponse import CreateContainerResponse
+from models.ContainerUrlsResponse import ContainerUrlsResponse
+from models.FileStructureResponse import FileStructureResponse
+# --- 모델 관련 import 끝 ---
 from utils.util import get_api_client, _get_sendable_socket, _build_netloc_and_schemes, is_unlimited, create_file
+import json
+from pathlib import Path
 
 app = FastAPI()
 
@@ -357,6 +365,104 @@ async def websocket_terminal(
             await websocket.close()
     
 
+
+# == 컨테이너 파일 구조 읽기 == #
+@app.get("/files/{container_id}", response_model=FileStructureResponse)
+def get_files(container_id: str):
+    try:
+        full_id = _resolve_container_id(container_id)
+        container = docker_client.containers.get(full_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    # 컨테이너에서 파일 및 폴더 목록 가져오기 
+    exit_code, raw_output = container.exec_run(f"find {WORKSPACE} -print0")
+    if exit_code != 0:
+        # WORKSPACE가 없는 초기 상태일 수 있으므로 빈 구조 반환
+        return FileStructureResponse(
+            tree={"id": "root", "type": "folder", "children": []},
+            fileMap={"root": {"name": "", "type": "folder"}}
+        )
+
+    paths = [p for p in raw_output.decode().split('\0') if p]
+
+    # 컨테이너에서 파일 목록 가져오기 
+    _, file_paths_blob = container.exec_run(f"find {WORKSPACE} -type f -print0")
+    file_paths = file_paths_blob.decode().split('\0')
+    file_paths_set = set(file_paths) # 빠른 조회를 위해 set으로 변환
+
+    # 파일 내용 한 번에 읽어오기 
+    contents = {}
+    valid_file_paths = [p for p in file_paths if p] # 공백 제거
+
+    if valid_file_paths:
+
+        delimiter = "---FILE-CONTENT-DELIMITER---"
+
+        # 파일 내용 출력 명령어 생성 및 실행
+        paths_str = " ".join([f"'{p}'" for p in valid_file_paths])
+        cmd = f"bash -c 'for f in {paths_str}; do cat \"$f\"; echo \"{delimiter}\"; done'"
+        _, content_blob = container.exec_run(cmd)
+        
+        split_contents = content_blob.decode().split(delimiter)
+        # 마지막 구분자 때문에 생기는 빈 항목 제거
+        if len(split_contents) > len(valid_file_paths):
+            split_contents.pop()
+
+        for i, path in enumerate(valid_file_paths):
+            contents[path] = split_contents[i]
+
+
+    # tree와 fileMap 구조로 재구성
+    file_map = {"root": {"name": "", "type": "folder"}}
+    nodes = {"root": {"id": "root", "type": "folder", "children": []}}
+    
+    # 경로를 정렬하여 부모가 항상 자식보다 먼저 오도록 함
+    for path_str in sorted(paths):
+        p = Path(path_str)
+        if p == Path(WORKSPACE): continue # 작업공간 루트는 건너뜀
+
+        id = str(uuid.uuid4())
+        name = p.name
+        parent_path_str = str(p.parent)
+        
+        parent_id = "root"
+        if parent_path_str != WORKSPACE:
+            # 부모 노드의 id 찾기
+            for node_id, node in nodes.items():
+                if node.get("path") == parent_path_str:
+                    parent_id = node_id
+                    break
+
+        # 파일 여부를 file_paths_set에 있는지 확인하여 정확하게 판단
+        is_file = path_str in file_paths_set
+        node_type = "file" if is_file else "folder"
+        
+        new_node = {"id": id, "type": node_type, "path": path_str}
+        if not is_file:
+            new_node["children"] = []
+
+        # 부모가 없는 경우(예: 잘못된 경로) 건너뛰기
+        if parent_id not in nodes: continue 
+
+        nodes[id] = new_node
+        # 부모 노드에 children이 없으면 생성
+        if "children" not in nodes[parent_id]:
+             nodes[parent_id]["children"] = []
+        nodes[parent_id]["children"].append(new_node)
+        
+        file_map[id] = {
+            "name": name,
+            "type": node_type,
+            "content": contents.get(path_str, None) if is_file else None
+        }
+
+    # 'path' 임시 키 제거
+    for node in nodes.values():
+        node.pop("path", None)
+
+    return FileStructureResponse(tree=nodes["root"], fileMap=file_map)
+
 # == 코드 실행 == #
 @app.post("/run")
 def run_code(req: CodeRequest):
@@ -379,11 +485,8 @@ def run_code(req: CodeRequest):
         raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
 
     try:
-        container.exec_run([
-            "bash", "-lc",
-            # workspace 폴더 생성 및 내용물 존재 시 삭제
-            f"mkdir -p '{WORKSPACE}' && find '{WORKSPACE}' -mindepth 1 -delete"
-        ])
+        # WORKSPACE 폴더가 없는 경우에만 생성
+        container.exec_run(["mkdir", "-p", WORKSPACE])
 
         # 파일 생성
         exec_path = create_file(container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE)

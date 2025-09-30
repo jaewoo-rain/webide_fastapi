@@ -7,23 +7,6 @@ from urllib.parse import urlsplit
 from config import SPRING_BOOT_API_URL
 # == 유틸 == #
 
-# 10000 ~ 10100포트 사이 비어있는 포트 반
-# def find_free_port(start: int = 10000, end: int = 10100, host: str = "0.0.0.0") -> int:
-#     """[start, end] 범위에서 사용 가능한 TCP 포트를 하나 찾아 반환.
-#     주의: 반환 직후 다른 프로세스가 먼저 잡을 수 있는 레이스가 있습니다.
-#     """
-#     for port in range(start, end + 1):
-#         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#         try:
-#             # SO_REUSEADDR는 일부 OS에서 TIME_WAIT 소켓 재바인드를 허용하므로 0(기본) 유지
-#             s.bind((host, port))
-#             return port
-#         except OSError:
-#             continue
-#         finally:
-#             s.close()
-#     raise RuntimeError(f"No free port in range {start}-{end}")
-
 # 스프링 연동
 async def get_api_client(request: Request):
     token = _extract_bearer_token(request)
@@ -97,13 +80,18 @@ def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None)
 
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
-        path.append(folder_name) # 현재까지 경로 리스트에 현재 폴더의 이름을 추가
-        full_path = base_path + "/" + "/".join(path)
-        container.exec_run(cmd=["mkdir", "-p", full_path])
+            # 폴더 이름이 비어있지 않을 때만 경로에 추가하고 폴더를 생성합니다.
+        if folder_name:
+            path.append(folder_name)
+            full_path = base_path + "/" + "/".join(path)
+            container.exec_run(cmd=["mkdir", "-p", full_path])
+
         for node in tree.get("children", []):
             sub = create_file(container, node, fileMap, run_code, base_path, path)
             if sub: result = sub
-        path.pop()
+        
+        if folder_name:
+            path.pop()
 
     elif tree["type"] == "file":
         file_name = fileMap[tree["id"]]["name"]
@@ -115,3 +103,6 @@ def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None)
         container.exec_run(cmd=["bash", "-c", f"echo '{safe}' > '{full_path}'"])
 
     return result
+
+
+
