@@ -381,6 +381,7 @@ def run_code(req: CodeRequest):
     try:
         container.exec_run([
             "bash", "-lc",
+            # workspace 폴더 생성 및 내용물 존재 시 삭제
             f"mkdir -p '{WORKSPACE}' && find '{WORKSPACE}' -mindepth 1 -delete"
         ])
 
@@ -393,7 +394,7 @@ def run_code(req: CodeRequest):
         container.exec_run(["bash", "-lc", f"pkill -f '{WORKSPACE}' || true"])
 
         # venv 파이썬으로 실행 (명시적으로)
-        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
+        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode()) # 실행할 파일의 전체 경로를 PTY(가상 터미널) 세션으로 전송
 
         # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
         for _ in range(5):

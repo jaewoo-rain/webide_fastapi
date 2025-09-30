@@ -27,6 +27,6 @@ INTERNAL_NOVNC_PORT = 6081 # 내부 noVNC 포트 번호
 ALLOWED_NOVNC_PORTS = list(range(10000, 10101))
 
 
-WORKSPACE="/opt/workspace"
+WORKSPACE="/opt/workspace" # 코드 저장 폴더
 SPRING_BOOT_API_URL="http://localhost:8080"
 

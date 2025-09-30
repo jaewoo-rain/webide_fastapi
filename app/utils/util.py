@@ -92,12 +92,12 @@ def is_unlimited(UNLIMITED_ROLES, role: str) -> bool:
 # == 파일 생성 로직 == #
 def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None):
     if path is None:
-        path = []
+        path = [] # 현재까지 경로 저장 리스트
     result = None
 
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
-        path.append(folder_name)
+        path.append(folder_name) # 현재까지 경로 리스트에 현재 폴더의 이름을 추가
         full_path = base_path + "/" + "/".join(path)
         container.exec_run(cmd=["mkdir", "-p", full_path])
         for node in tree.get("children", []):
