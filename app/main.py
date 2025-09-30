@@ -19,6 +19,7 @@ from models.CreateContainerRequest import CreateContainerRequest
 from models.CreateContainerResponse import CreateContainerResponse
 from models.ContainerUrlsResponse import ContainerUrlsResponse
 from models.FileStructureResponse import FileStructureResponse
+from models.CodeSaveRequest import CodeSaveRequest
 # --- 모델 관련 import 끝 ---
 from utils.util import get_api_client, _get_sendable_socket, _build_netloc_and_schemes, is_unlimited, create_file
 import json
@@ -514,3 +515,27 @@ def run_code(req: CodeRequest):
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
 
+@app.post("/save")
+def save_code(req: CodeSaveRequest):
+
+    # 컨테이너 ID 풀ID로 정규화
+    try:
+        container = docker_client.containers.get(req.container_id)
+    except docker.errors.NotFound:
+        try:
+            full_id = _resolve_container_id(req.container_id)
+            container = docker_client.containers.get(full_id)
+        except docker.errors.NotFound:
+            return JSONResponse(status_code=404, content={"error": "Container not found"})
+
+    try:
+        # WORKSPACE 폴더가 없는 경우에만 생성
+        container.exec_run(["mkdir", "-p", WORKSPACE])
+
+        # 파일 생성
+        exec_path = create_file(container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE)
+        if not exec_path:
+            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
+    
+    except Exception as e:
+        raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
