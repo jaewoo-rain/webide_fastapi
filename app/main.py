@@ -13,19 +13,13 @@ from security.security import get_current_user, AuthUser, _extract_bearer_token
 from urllib.parse import urlsplit
 from config import ROLE_ADMIN, ROLE_MEMBER, ROLE_FREE, FREE_MAX_CONTAINERS, DOCKER_NETWORK, VNC_IMAGE, CONTAINER_ENV_DEFAULT, INTERNAL_NOVNC_PORT, WORKSPACE, ALLOWED_NOVNC_PORTS
 from docker_client import get_docker
-# --- 모델 관련 import 시작 ---
-from models.CodeRequest import CodeRequest
-from models.CreateContainerRequest import CreateContainerRequest
-from models.CreateContainerResponse import CreateContainerResponse
-from models.ContainerUrlsResponse import ContainerUrlsResponse
+from models import CodeRequest, CreateContainerRequest, CreateContainerResponse, ContainerUrlsResponse
 from models.FileStructureResponse import FileStructureResponse
 from models.CodeSaveRequest import CodeSaveRequest
-# --- 모델 관련 import 끝 ---
 from utils.util import get_api_client, _get_sendable_socket, _build_netloc_and_schemes, is_unlimited, create_file
-import json
 from pathlib import Path
 
-app = FastAPI()
+app = FastAPI()                 
 
 # CORS 설정
 app.add_middleware(
@@ -35,6 +29,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # == 공통 설정 == #
 # Docker 클라이언트 & 컨테이너 이름
@@ -277,8 +272,8 @@ async def websocket_terminal(
 
     # 풀 ID로 정규화
     try:
-        full_id = _resolve_container_id(cid)
-        container = docker_client.containers.get(full_id)
+        full_cid = _resolve_container_id(cid)
+        container = docker_client.containers.get(full_cid)
     except docker.errors.NotFound:
         await websocket.send_text("컨테이너가 없습니다.")
         await websocket.close()
@@ -287,7 +282,7 @@ async def websocket_terminal(
     # cid, sid 이용해서 세션 만들어 넣기
     if not client_sid:
         client_sid = uuid.uuid4().hex
-    key = (full_id, client_sid)
+    key = (full_cid, client_sid)
     if key in sessions:
         await websocket.close(code=4409, reason="sid already in use")
         return
@@ -331,7 +326,7 @@ async def websocket_terminal(
     async def reader():
         try:
             while True:
-                data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
+                data = await loop.run_in_executor(None, pty.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
                 if not data:
                     break
                 await websocket.send_text(data.decode(errors="ignore"))
@@ -343,7 +338,7 @@ async def websocket_terminal(
         try:
             while True:
                 msg = await websocket.receive_text()
-                await loop.run_in_executor(None, sock.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달
+                await loop.run_in_executor(None, pty.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달
         except WebSocketDisconnect:
             print("🔌 클라이언트 WebSocket 연결 종료")
         except RuntimeError:
@@ -366,6 +361,61 @@ async def websocket_terminal(
             await websocket.close()
     
 
+# == 코드 실행 == #
+@app.post("/run")
+def run_code(req: CodeRequest):
+
+    # 컨테이너 ID 풀ID로 정규화
+    try:
+        container = docker_client.containers.get(req.container_id)
+    except docker.errors.NotFound:
+        try:
+            full_id = _resolve_container_id(req.container_id)
+            container = docker_client.containers.get(full_id)
+        except docker.errors.NotFound:
+            return JSONResponse(status_code=404, content={"error": "Container not found"})
+
+    full_id = container.id
+    key = (full_id, req.session_id)
+    pty = sessions.get(key) # 세션이용해서 PTY 연결하기
+
+    if not pty:
+        raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
+
+    try:
+        # container.exec_run([
+        #     "bash", "-lc",
+        #     f"mkdir -p '{WORKSPACE}' && find '{WORKSPACE}' -mindepth 1 -delete"
+        # ])
+        
+        # WORKSPACE 폴더가 없는 경우에만 생성
+        container.exec_run(["mkdir", "-p", WORKSPACE])
+
+        # 파일 생성
+        exec_path = create_file(container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE)
+        if not exec_path:
+            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
+    
+        # 이전 실행 종료
+        container.exec_run(["bash", "-lc", f"pkill -f '{WORKSPACE}' || true"])
+
+        # venv 파이썬으로 실행 (명시적으로)
+        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode())
+
+        # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
+        for _ in range(5):
+            check = container.exec_run( 
+                cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' && echo yes || echo no"]
+            )
+            # 루트 트리에 GUI 창이 존재하는지 체크
+            if b"yes" in check.output:
+                return {"mode": "gui"}
+            time.sleep(0.2)
+
+        # CLI 모드 결과 
+        return {"mode": "cli"}
+    except Exception as e:
+        raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
 
 # == 컨테이너 파일 구조 읽기 == #
 @app.get("/files/{container_id}", response_model=FileStructureResponse)
@@ -464,56 +514,7 @@ def get_files(container_id: str):
 
     return FileStructureResponse(tree=nodes["root"], fileMap=file_map)
 
-# == 코드 실행 == #
-@app.post("/run")
-def run_code(req: CodeRequest):
 
-    # 컨테이너 ID 풀ID로 정규화
-    try:
-        container = docker_client.containers.get(req.container_id)
-    except docker.errors.NotFound:
-        try:
-            full_id = _resolve_container_id(req.container_id)
-            container = docker_client.containers.get(full_id)
-        except docker.errors.NotFound:
-            return JSONResponse(status_code=404, content={"error": "Container not found"})
-
-    full_id = container.id
-    key = (full_id, req.session_id)
-    pty = sessions.get(key) # 세션이용해서 PTY 연결하기
-
-    if not pty:
-        raise HTTPException(400, detail="PTY 세션이 준비되지 않았습니다. 먼저 /ws 로 연결하세요.")
-
-    try:
-        # WORKSPACE 폴더가 없는 경우에만 생성
-        container.exec_run(["mkdir", "-p", WORKSPACE])
-
-        # 파일 생성
-        exec_path = create_file(container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE)
-        if not exec_path:
-            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
-    
-        # 이전 실행 종료
-        container.exec_run(["bash", "-lc", f"pkill -f '{WORKSPACE}' || true"])
-
-        # venv 파이썬으로 실행 (명시적으로)
-        pty.send(f"{venv_path}/bin/python '{exec_path}'\n".encode()) # 실행할 파일의 전체 경로를 PTY(가상 터미널) 세션으로 전송
-
-        # 최대 2초 (0.2초 * 10번) 동안 GUI 실행 여부를 확인
-        for _ in range(5):
-            check = container.exec_run( 
-                cmd=["bash", "-c", "DISPLAY=:1 xwininfo -root -tree | grep -E '\"[^ ]+\"' && echo yes || echo no"]
-            )
-            # 루트 트리에 GUI 창이 존재하는지 체크
-            if b"yes" in check.output:
-                return {"mode": "gui"}
-            time.sleep(0.2)
-
-        # CLI 모드 결과 
-        return {"mode": "cli"}
-    except Exception as e:
-        raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
 
 @app.post("/save")
 def save_code(req: CodeSaveRequest):
@@ -539,3 +540,7 @@ def save_code(req: CodeSaveRequest):
     
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
+
+
+app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="frontend")
+
