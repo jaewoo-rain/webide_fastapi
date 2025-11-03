@@ -20,6 +20,9 @@ from models.CreateContainerResponse import CreateContainerResponse
 from models.ContainerUrlsResponse import ContainerUrlsResponse
 from models.FileStructureResponse import FileStructureResponse
 from models.CodeSaveRequest import CodeSaveRequest
+from models.FileDeleteRequest import FileDeleteRequest 
+from models.RenameFileRequest import RenameFileRequest
+
 # --- 모델 관련 import 끝 ---
 from utils.util import get_api_client, _get_sendable_socket, _build_netloc_and_schemes, is_unlimited, create_file
 import json
@@ -370,6 +373,7 @@ async def websocket_terminal(
 # == 컨테이너 파일 구조 읽기 == #
 @app.get("/files/{container_id}", response_model=FileStructureResponse)
 def get_files(container_id: str):
+    print("\n--- Debugging get_files ---")
     try:
         full_id = _resolve_container_id(container_id)
         container = docker_client.containers.get(full_id)
@@ -419,6 +423,7 @@ def get_files(container_id: str):
     nodes = {"root": {"id": "root", "type": "folder", "children": []}}
     
     # 경로를 정렬하여 부모가 항상 자식보다 먼저 오도록 함
+    print("[DEBUG] Starting tree construction...")
     for path_str in sorted(paths):
         p = Path(path_str)
         if p == Path(WORKSPACE): continue # 작업공간 루트는 건너뜀
@@ -432,6 +437,7 @@ def get_files(container_id: str):
             # 부모 노드의 id 찾기
             for node_id, node in nodes.items():
                 if node.get("path") == parent_path_str:
+                    print(f"[DEBUG] SKIPPING: Could not find parent for {path_str}")
                     parent_id = node_id
                     break
 
@@ -444,7 +450,9 @@ def get_files(container_id: str):
             new_node["children"] = []
 
         # 부모가 없는 경우(예: 잘못된 경로) 건너뛰기
-        if parent_id not in nodes: continue 
+        if parent_id not in nodes: 
+            print(f"[DEBUG] SKIPPING: parent_id '{parent_id}' not in node for {path_str}")
+            continue 
 
         nodes[id] = new_node
         # 부모 노드에 children이 없으면 생성
@@ -455,13 +463,14 @@ def get_files(container_id: str):
         file_map[id] = {
             "name": name,
             "type": node_type,
+            "path": path_str,
             "content": contents.get(path_str, None) if is_file else None
         }
 
     # 'path' 임시 키 제거
     for node in nodes.values():
         node.pop("path", None)
-
+    print("--- End of get_files debug ---\n")
     return FileStructureResponse(tree=nodes["root"], fileMap=file_map)
 
 # == 코드 실행 == #
@@ -534,8 +543,54 @@ def save_code(req: CodeSaveRequest):
 
         # 파일 생성
         exec_path = create_file(container, req.tree, req.fileMap, req.run_code, base_path=WORKSPACE)
-        if not exec_path:
-            raise HTTPException(400, "실행 파일(run_code)을 찾지 못했습니다.")
-    
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
+
+# == 파일명 수정 == #
+@app.patch("/files/{container_id}")
+def rename_file(container_id: str, req: RenameFileRequest):
+    print("\n--- Debugging rename_file ---")
+    try:
+        full_id = _resolve_container_id(container_id)
+        container = docker_client.containers.get(full_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")   
+   
+    # 경로 유효성 검사
+    if not req.old_path.startswith(WORKSPACE) or "/" in req.new_name:        
+        raise HTTPException(status_code=400, detail="Invalid old path or new name.")
+   
+    # 새로운 경로 생성
+    old_path_obj = Path(req.old_path)
+    new_path_obj = old_path_obj.parent / req.new_name    
+    
+    # new_path를 POSIX (Linux) 형식의 문자열로 변환
+    new_path_posix = new_path_obj.as_posix()
+    
+    # 컨테이너 내에서 mv 명령 실행
+    exit_code, output = container.exec_run(f"mv '{req.old_path}' '{new_path_posix}'")
+
+    
+    if exit_code != 0:
+        error_message = output.decode().strip()
+        raise HTTPException(status_code=500, detail=f"Failed to rename: {error_message}")
+    
+    # 성공 시, 새로운 경로를 포함하여 응답
+    return {"message": "Rename successful", "new_path": new_path_posix} 
+# == 파일 삭제 == #
+@app.delete("/files/{container_id}")
+def delete_file(container_id: str, req: FileDeleteRequest):
+    try:
+        full_id = _resolve_container_id(container_id)
+        container = docker_client.containers.get(full_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    # 파일 삭제 명령 실행
+    exit_code, output = container.exec_run(f"rm -f '{req.file_path}'")
+
+    if exit_code != 0:
+        error_message = output.decode().strip()
+        raise HTTPException(status_code=500, detail=f"파일 삭제 실패: {output.decode()}")
+
+    return {"message": f"파일 '{req.file_path}'이(가) 성공적으로 삭제되었습니다."}

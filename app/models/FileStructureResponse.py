@@ -10,6 +10,7 @@ class FileMapItem(BaseModel):
     name: str
     content: Optional[str] = None
     type: str
+    path: Optional[str] = None
     
 class FileStructureResponse(BaseModel):
     tree: FileNode
