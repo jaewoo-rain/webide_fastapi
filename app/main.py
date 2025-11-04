@@ -577,6 +577,7 @@ def rename_file(container_id: str, req: RenameFileRequest):
     
     # 성공 시, 새로운 경로를 포함하여 응답
     return {"message": "Rename successful", "new_path": new_path_posix} 
+
 # == 파일 삭제 == #
 @app.delete("/files/{container_id}")
 def delete_file(container_id: str, req: FileDeleteRequest):
@@ -594,3 +595,40 @@ def delete_file(container_id: str, req: FileDeleteRequest):
         raise HTTPException(status_code=500, detail=f"파일 삭제 실패: {output.decode()}")
 
     return {"message": f"파일 '{req.file_path}'이(가) 성공적으로 삭제되었습니다."}
+
+@app.delete("/containers/{container_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_container(
+    container_id: str,
+    user: AuthUser = Depends(get_current_user),
+    api_client: httpx.AsyncClient = Depends(get_api_client),
+):
+
+    try:
+        full_id = _resolve_container_id(container_id)
+    except (docker.errors.NotFound, RuntimeError):
+        full_id = container_id
+
+    # DB에서 삭제
+    try:
+        delete_resp = await api_client.delete(f"/internal/api/containers/{full_id}/owner/{user.username}")
+        # 403 Forbidden 또는 다른 클라이언트 오류 발생 시, 해당 오류를 프론트엔드로 전달
+        if 400 <= delete_resp.status_code < 500:
+            raise HTTPException(status_code=delete_resp.status_code, detail=f"Failed to delete container from DB: {delete_resp.text}")
+
+         # 그 외 서버 오류 발생 시
+        delete_resp.raise_for_status()
+
+    except httpx.RequestError as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Data server connection failed: {e}")
+
+
+    # 도커 컨테이너 삭제
+    try:
+        container_to_remove = docker_client.containers.get(full_id)
+        container_to_remove.remove(force=True)
+    except docker.errors.NotFound:
+        pass  # 이미 삭제된 경우
+    except Exception as e:
+        print(f"Error removing docker container {full_id}: {e}")
+
+    return
