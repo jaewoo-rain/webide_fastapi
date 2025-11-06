@@ -22,6 +22,7 @@ from models.FileStructureResponse import FileStructureResponse
 from models.CodeSaveRequest import CodeSaveRequest
 from models.FileDeleteRequest import FileDeleteRequest 
 from models.RenameFileRequest import RenameFileRequest
+from models.RenameProjectRequest import RenameProjectRequest
 
 # --- 모델 관련 import 끝 ---
 from utils.util import get_api_client, _get_sendable_socket, _build_netloc_and_schemes, is_unlimited, create_file
@@ -614,13 +615,13 @@ async def delete_container(
         delete_resp = await api_client.delete(f"/internal/api/containers/{full_id}/owner/{user.username}")
         # 403 Forbidden 또는 다른 클라이언트 오류 발생 시, 해당 오류를 프론트엔드로 전달
         if 400 <= delete_resp.status_code < 500:
-            raise HTTPException(status_code=delete_resp.status_code, detail=f"Failed to delete container from DB: {delete_resp.text}")
+            raise HTTPException(status_code=delete_resp.status_code, detail=f"DB 업데이트 실패: {delete_resp.text}")
 
          # 그 외 서버 오류 발생 시
         delete_resp.raise_for_status()
 
     except httpx.RequestError as e:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Data server connection failed: {e}")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"DB 접근 실패: {e}")
 
 
     # 도커 컨테이너 삭제
@@ -630,6 +631,32 @@ async def delete_container(
     except docker.errors.NotFound:
         pass  # 이미 삭제된 경우
     except Exception as e:
-        print(f"Error removing docker container {full_id}: {e}")
+        print(f"컨테이너 삭제 실패 {full_id}: {e}")
 
     return
+
+# == 컨테이너 수정 == #
+@app.patch("/containers/{container_id}")
+async def update_project_name(
+    container_id: str,
+    req: RenameProjectRequest,
+    user: AuthUser = Depends(get_current_user),
+    api_client: httpx.AsyncClient = Depends(get_api_client),
+):
+    try:
+        full_id = _resolve_container_id(container_id)
+    except (docker.errors.NotFound, RuntimeError):
+        full_id = container_id
+                                                                                                                                                                                                                                             
+    try:
+        update_resp = await api_client.patch(
+            f"/internal/api/containers/{full_id}/owner/{user.username}",
+            json={"projectName": req.project_name}
+        )
+        if 400 <= update_resp.status_code < 500:
+            raise HTTPException(status_code=update_resp.status_code, detail=f"DB 업데이트 실패: {update_resp.text}")
+        update_resp.raise_for_status()
+    except httpx.RequestError as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"DB 접속 실패 {e}")
+                                                                                                                                                                                                                                             
+    return {"message": "성공적으로 컨테이너명 업데이트"}

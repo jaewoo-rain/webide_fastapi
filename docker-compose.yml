@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  web-ide:
+    build:
+      context: ./app
+      dockerfile: dockerfile
+    ports:
+      - "8000:8000"
+      # 컨테이너가 생성할 noVNC 포트 범위를 호스트에 연결합니다.
+      # config.py의 ALLOWED_NOVNC_PORTS와 일치해야 합니다.
+      - "10000-10100:10000-10100"
+    volumes:
+      # Docker를 제어할 수 있도록 호스트의 Docker 소켓을 연결합니다.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # FastAPI 서버가 외부에서 접근 가능한 자신의 주소를 알기 위해 필요합니다.
+      # 실제 배포 환경의 도메인이나 IP 주소로 변경해야 합니다.
+      - APP_HOST=localhost
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
