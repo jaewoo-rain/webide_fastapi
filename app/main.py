@@ -596,6 +596,7 @@ def delete_file(container_id: str, req: FileDeleteRequest):
 
     return {"message": f"파일 '{req.file_path}'이(가) 성공적으로 삭제되었습니다."}
 
+# == 컨테이너 삭제 == #
 @app.delete("/containers/{container_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_container(
     container_id: str,
