@@ -28,5 +28,5 @@ ALLOWED_NOVNC_PORTS = list(range(10000, 10101))
 
 
 WORKSPACE="/opt/workspace" # 코드 저장 폴더
-SPRING_BOOT_API_URL="http://localhost:8080"
+SPRING_BOOT_API_URL="http://ide-boot:8080"
 

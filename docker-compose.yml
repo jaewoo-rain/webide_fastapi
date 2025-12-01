@@ -1,20 +1,96 @@
-version: '3.8'
-
 services:
-  web-ide:
+  # FastAPI 도커 메니저 서비스
+  ide-fastapi:
+    container_name: ide-fastapi
     build:
-      context: ./app
+      context: ./app 
       dockerfile: dockerfile
     ports:
-      - "8000:8000"
-      # 컨테이너가 생성할 noVNC 포트 범위를 호스트에 연결합니다.
-      # config.py의 ALLOWED_NOVNC_PORTS와 일치해야 합니다.
-      - "10000-10100:10000-10100"
+      - "8001:8000"
     volumes:
-      # Docker를 제어할 수 있도록 호스트의 Docker 소켓을 연결합니다.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # FastAPI 서버가 외부에서 접근 가능한 자신의 주소를 알기 위해 필요합니다.
-      # 실제 배포 환경의 도메인이나 IP 주소로 변경해야 합니다.
-      - APP_HOST=localhost
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+      - APP_HOST=${APP_HOST}
+      - SPRING_API_URL=http://ide-boot:8080
+      # (추가!) 동적 컨테이너가 접속할 네트워크를 지정
+      - DOCKER_NETWORK=webide_fastapi_webide-net
+    depends_on:
+      ide-boot:
+        condition: service_started
+    command: >
+      sh -c "
+        echo 'Waiting 15 seconds for ide-boot to start...'
+        sleep 15
+        echo 'Starting FastAPI...'
+        uvicorn main:app --host 0.0.0.0 --port 8000
+      "
+    networks: 
+      - webide-net
+
+  # Spring Boot '인증/DB' 서비스 
+  ide-boot:
+    container_name: ide-boot
+    build:
+      context: ../webide-boot
+      dockerfile: Dockerfile
+      network: host
+    ports:
+      - "12345:8080"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:mysql://ide-db:3306/test?serverTimezone=Asia/Seoul&characterEncoding=utf8&useUnicode=true
+      - SPRING_DATASOURCE_USERNAME=root
+      - SPRING_DATASOURCE_PASSWORD=0000
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=create
+      - SPRING_JWT_SECRET=TlvldbghkdlxlddlqslekdkwkdkwkghkdlxlddufmasjanejdnjdpdjzjsdmfxmfdjvldbvldbTlvldbvldbvldbTlvldb
+    depends_on:
+      ide-db:
+        condition: service_healthy 
+    command: >
+      sh -c "
+        java -jar app.jar
+      "
+    networks:
+      - webide-net
+
+  # MySQL '데이터베이스' 서비스 
+  ide-db:
+    container_name: ide-db
+    image: mysql:8.0
+    ports:
+      - "33067:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=0000
+      - MYSQL_DATABASE=test
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p0000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: # (추가!)
+      - webide-net
+  # React 프론트엔드 서비스
+  ide-frontend:
+    container_name: ide-frontend
+    build:
+      # docker-compose.yml 기준 상위 폴더의 webide_frontend 폴더를 빌드
+      context: ../webide-frontend
+      dockerfile: Dockerfile
+      
+    ports:
+      # 서버의 80번 포트(HTTP)를 Nginx의 80번 포트에 연결
+      - "88:80" 
+    depends_on:
+      - ide-fastapi
+      - ide-boot
+    networks:
+      - webide-net # (중요!) 다른 서비스와 동일한 네트워크 사용    
+volumes:
+  mysql-data:
+
+# (추가!) 공용 네트워크 정의
+networks:
+  webide-net:
+    driver: bridge

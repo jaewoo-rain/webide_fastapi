@@ -108,7 +108,10 @@ async def create_container(
         except httpx.RequestError as e:
             raise HTTPException(503, detail=f"데이터 서버 연결 실패: {e}")
 
-    image = body.image or VNC_IMAGE
+    # image = body.image or VNC_IMAGE
+    print(f"컨테이너 생성 : body= {body.image}, vnc= {VNC_IMAGE}")
+    image = 'vnc'
+
     env = dict(CONTAINER_ENV_DEFAULT)
     if body.env:
         env.update(body.env)
@@ -192,7 +195,8 @@ async def create_container(
     # 4) URL
     netloc, http_scheme, ws_scheme, host_only = _build_netloc_and_schemes(request)
     sid = uuid.uuid4().hex
-    ws_url = f"{ws_scheme}://{netloc}/ws?cid={container.id}&sid={sid}"
+    # Nginx 프록시를 통과하도록 /fastapi 접두사 추가
+    ws_url = f"{ws_scheme}://{netloc}:88/fastapi/ws?cid={container.id}&sid={sid}" 
     vnc_url = f"{http_scheme}://{host_only}:{host_novnc_port}/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
 
     # 5) 응답
@@ -208,8 +212,6 @@ async def create_container(
         ws_url=ws_url,
         port=host_novnc_port,
     )
-
-
 
 
 # == 내 컨테이너 목록 조회 == #
@@ -259,15 +261,13 @@ async def get_container_urls(
     netloc, http_scheme, ws_scheme, host_only = _build_netloc_and_schemes(request)
 
     sid = uuid.uuid4().hex
-    ws_url = f"{ws_scheme}://{netloc}/ws?cid={full_id}&sid={sid}"
+    # Nginx 프록시를 통과하도록 /fastapi 접두사 추가
+    ws_url = f"{ws_scheme}://{netloc}:88/fastapi/ws?cid={full_id}&sid={sid}"    
     vnc_url = (
         f"{http_scheme}://{host_only}:{host_port}"
         "/vnc.html?autoconnect=true&encrypt=0&resize=remote&password=jaewoo"
     )
     return ContainerUrlsResponse(cid=full_id, ws_url=ws_url, vnc_url=vnc_url)
-
-
-
 
 
 # (cid, sid) ─> (우리 앱의 세션 키) -> pty_socket ─> (Docker 내부)─> exec_id, TTY
@@ -277,15 +277,16 @@ async def websocket_terminal(
     cid: str = Query(..., alias="cid"), # 컨테이너 아이디
     client_sid: Optional[str] = Query(None, alias="sid") # 터미널 세션 식별자
 ):
+    print(f"🔥 /ws 접속 시도: cid={cid}, sid={client_sid}")
     await websocket.accept()  # 수락
-
+    
     # 풀 ID로 정규화
     try:
         full_id = _resolve_container_id(cid)
         container = docker_client.containers.get(full_id)
     except docker.errors.NotFound:
         await websocket.send_text("컨테이너가 없습니다.")
-        await websocket.close()
+        # await websocket.close()
         return
     
     # cid, sid 이용해서 세션 만들어 넣기
@@ -335,22 +336,22 @@ async def websocket_terminal(
     async def reader():
         try:
             while True:
-                data = await loop.run_in_executor(None, sock.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
+                data = await loop.run_in_executor(None, pty.recv, 1024) # sock.recv(1024)가 blocking I/O이므로 run_in_executor를 통해 별도 스레드에서 실행, 1024 바이트씩 데이터 읽음
                 if not data:
                     break
                 await websocket.send_text(data.decode(errors="ignore"))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reader] exception: {e}")
 
     # 데이터를 컨테이너에게 보내기
     async def writer():
         try:
             while True:
                 msg = await websocket.receive_text()
-                await loop.run_in_executor(None, sock.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달
+                await loop.run_in_executor(None, pty.send, msg.encode()) # 받은 메시지를 바이너리로 인코딩 후 sock.send()로 bash 입력에 전달
         except WebSocketDisconnect:
             print("🔌 클라이언트 WebSocket 연결 종료")
-        except RuntimeError:
+        except RuntimeError as e:
             print(f"[write] RuntimeError: {e}")
 
     # 소켓 실행
@@ -361,13 +362,13 @@ async def websocket_terminal(
         # await websocket.close()
     finally:
         try:
-            sock.close()
+            pty.close()
         except Exception as e:
             print(f"소켓 종료 실패: {e}")
         sessions.pop(key, None)
 
-        if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
-            await websocket.close()
+        # if websocket.application_state != WebSocketState.DISCONNECTED:  # 상태 체크 추가
+        #     await websocket.close()
     
 
 
@@ -525,6 +526,7 @@ def run_code(req: CodeRequest):
     except Exception as e:
         raise HTTPException(500, detail=f"PTY 전송 실패: {e}")
 
+# 코드 저장하기
 @app.post("/save")
 def save_code(req: CodeSaveRequest):
 
@@ -571,7 +573,6 @@ def rename_file(container_id: str, req: RenameFileRequest):
     # 컨테이너 내에서 mv 명령 실행
     exit_code, output = container.exec_run(f"mv '{req.old_path}' '{new_path_posix}'")
 
-    
     if exit_code != 0:
         error_message = output.decode().strip()
         raise HTTPException(status_code=500, detail=f"Failed to rename: {error_message}")
