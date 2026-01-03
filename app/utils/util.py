@@ -1,5 +1,5 @@
 import socket,  docker, httpx
-
+from urllib.parse import urlsplit
 from fastapi import Request
 
 from security.security import  _extract_bearer_token
@@ -46,48 +46,76 @@ def _get_sendable_socket(socklike) -> socket.socket:
     # 4) 실패
     raise TypeError("send/recv 가능한 소켓을 찾지 못했습니다.")
 
-# URL 분리하기
-def _build_netloc_and_schemes(request: Request) -> tuple[str, str, str, str]:
-    """
-    http://localhost:8000 → netloc="localhost:8000", http_scheme="http", ws_scheme="ws",
-    """
+# # URL 분리하기
+# def _build_netloc_and_schemes(request: Request) -> tuple[str, str, str, str]:
+#     """
+#     http://localhost:8000 → netloc="localhost:8000", http_scheme="http", ws_scheme="ws",
+#     """
+#     xf_host = request.headers.get("x-forwarded-host")
+#     host_hdr = request.headers.get("host")
+#     if xf_host:
+#         netloc = xf_host
+#     elif host_hdr:
+#         netloc = host_hdr
+#     else:
+#         port = request.url.port or (443 if request.url.scheme == "https" else 80)
+#         netloc = f"{request.client.host}:{port}"
+
+#     xf_proto = request.headers.get("x-forwarded-proto")
+#     http_scheme = xf_proto or request.url.scheme  # "http" or "https"
+#     ws_scheme = "wss" if http_scheme == "https" else "ws"
+#     host_only = urlsplit(f"//{netloc}", scheme="http").hostname or request.client.host
+#     return netloc, http_scheme, ws_scheme, host_only
+
+def _build_netloc_and_schemes(request: Request):
     xf_host = request.headers.get("x-forwarded-host")
     host_hdr = request.headers.get("host")
-    if xf_host:
-        netloc = xf_host
-    elif host_hdr:
-        netloc = host_hdr
-    else:
-        port = request.url.port or (443 if request.url.scheme == "https" else 80)
-        netloc = f"{request.client.host}:{port}"
+    netloc = xf_host or host_hdr
 
     xf_proto = request.headers.get("x-forwarded-proto")
-    http_scheme = xf_proto or request.url.scheme  # "http" or "https"
+    http_scheme = xf_proto or request.url.scheme
     ws_scheme = "wss" if http_scheme == "https" else "ws"
+
+    # ✅ 핵심: request.url.port로 보정
+    port = request.url.port or (443 if http_scheme == "https" else 80)
+
+    # netloc에 포트가 없으면 붙여준다
+    if netloc:
+        if ":" not in netloc:
+            netloc = f"{netloc}:{port}"
+    else:
+        netloc = f"{request.client.host}:{port}"
+
     host_only = urlsplit(f"//{netloc}", scheme="http").hostname or request.client.host
     return netloc, http_scheme, ws_scheme, host_only
-
 
 # role 이 member와 admin인지 확인하는 절차
 def is_unlimited(UNLIMITED_ROLES, role: str) -> bool:
     return role in UNLIMITED_ROLES
 
 # == 파일 생성 로직 == #
-def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None):
+# == 파일 생성 로직 (K8s 대응 버전) == #
+def create_file(pod_name, tree, fileMap, run_code, base_path="/opt", path=None):
     if path is None:
-        path = [] # 현재까지 경로 저장 리스트
+        path = [] 
     result = None
+
+    # 상위 scope에 있는 k8s_exec_run 함수를 호출합니다.
+    # main.py에 같이 있다면 바로 호출 가능하고, util.py라면 인자로 넘기거나 import 필요
+    from main import k8s_exec_run 
 
     if tree["type"] == "folder":
         folder_name = fileMap[tree["id"]]["name"]
-            # 폴더 이름이 비어있지 않을 때만 경로에 추가하고 폴더를 생성합니다.
+        
         if folder_name:
             path.append(folder_name)
             full_path = base_path + "/" + "/".join(path)
-            container.exec_run(cmd=["mkdir", "-p", full_path])
+            # 🚀 container.exec_run 대신 k8s_exec_run 사용
+            k8s_exec_run(pod_name, ["mkdir", "-p", full_path])
 
         for node in tree.get("children", []):
-            sub = create_file(container, node, fileMap, run_code, base_path, path)
+            # 재귀 호출 시에도 pod_name 전달
+            sub = create_file(pod_name, node, fileMap, run_code, base_path, path)
             if sub: result = sub
         
         if folder_name:
@@ -97,12 +125,49 @@ def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None)
         file_name = fileMap[tree["id"]]["name"]
         content = fileMap[tree["id"]].get("content", "")
         full_path = base_path + "/" + "/".join(path + [file_name])
+        
         if run_code == tree["id"]:
             result = full_path
-        safe = content.replace("'", "'\"'\"'")
-        container.exec_run(cmd=["bash", "-c", f"echo '{safe}' > '{full_path}'"])
+            
+        # 작은따옴표(')가 내용에 있을 경우를 대비한 이스케이프
+        safe_content = content.replace("'", "'\"'\"'")
+        
+        # 🚀 container.exec_run 대신 k8s_exec_run 사용
+        # bash의 'here document'나 echo를 사용하여 파일 쓰기 수행
+        cmd = ["bash", "-c", f"echo '{safe_content}' > '{full_path}'"]
+        k8s_exec_run(pod_name, cmd)
 
     return result
+# def create_file(container, tree, fileMap, run_code, base_path="/opt", path=None):
+#     if path is None:
+#         path = [] # 현재까지 경로 저장 리스트
+#     result = None
+
+#     if tree["type"] == "folder":
+#         folder_name = fileMap[tree["id"]]["name"]
+#             # 폴더 이름이 비어있지 않을 때만 경로에 추가하고 폴더를 생성합니다.
+#         if folder_name:
+#             path.append(folder_name)
+#             full_path = base_path + "/" + "/".join(path)
+#             container.exec_run(cmd=["mkdir", "-p", full_path])
+
+#         for node in tree.get("children", []):
+#             sub = create_file(container, node, fileMap, run_code, base_path, path)
+#             if sub: result = sub
+        
+#         if folder_name:
+#             path.pop()
+
+#     elif tree["type"] == "file":
+#         file_name = fileMap[tree["id"]]["name"]
+#         content = fileMap[tree["id"]].get("content", "")
+#         full_path = base_path + "/" + "/".join(path + [file_name])
+#         if run_code == tree["id"]:
+#             result = full_path
+#         safe = content.replace("'", "'\"'\"'")
+#         container.exec_run(cmd=["bash", "-c", f"echo '{safe}' > '{full_path}'"])
+
+#     return result
 
 
 

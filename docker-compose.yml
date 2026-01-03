@@ -90,7 +90,7 @@ services:
 volumes:
   mysql-data:
 
-# (추가!) 공용 네트워크 정의
+# 공용 네트워크
 networks:
   webide-net:
     driver: bridge

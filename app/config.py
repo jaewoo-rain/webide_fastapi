@@ -16,15 +16,16 @@ DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", None)  # 필요하면 bridge 이름
 # SPRING_BOOT_API_URL="http://localhost:8080/internal/api/"
 
 
-VNC_IMAGE = "vnc-webide"
+VNC_IMAGE = "jaewoo6257/vnc:1.0.0"
 CONTAINER_ENV_DEFAULT= {
     "VNC_PORT": "5901",
     "NOVNC_PORT": "6081",
     "VNC_GEOMETRY": "1024x768",
     "VNC_DEPTH": "24",
 }
-INTERNAL_NOVNC_PORT = 6081 # 내부 noVNC 포트 번호
-ALLOWED_NOVNC_PORTS = list(range(10000, 10101))
+INTERNAL_NOVNC_PORT = 6081  # 컨테이너 내부 noVNC 포트는 그대로
+ALLOWED_NOVNC_PORTS = list(range(31000, 31101))  # NodePort용 포트 범위 (31000~31100)
+
 
 
 WORKSPACE="/opt/workspace" # 코드 저장 폴더
